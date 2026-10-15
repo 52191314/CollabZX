@@ -1,0 +1,54 @@
+# ==============================================================================
+# HUIHUI SWIFT 1.5 (ABLITERATED) 125B - GOOGLE DRIVE INGESTION SCRIPT
+# ==============================================================================
+# Target Model: huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF
+# Quantization: swift-IQ3_XXS (75.96 GB Total)
+#
+# INSTRUCTIONS:
+# 1. Open Google Colab while logged into your 5 TB Google Account.
+# 2. Paste and run this script in a fresh code cell.
+# 3. Once complete, go to Google Drive -> Right click 'StrataModels' -> Share
+#    with your other 7 Google accounts -> "Add shortcut to Drive" in each.
+# ==============================================================================
+
+# Step 1: Mount your 5 TB Google Drive
+from google.colab import drive
+import os
+
+print("[1/5] Mounting Google Drive...")
+drive.mount('/content/drive')
+
+target_dir = "/content/drive/MyDrive/StrataModels/huihui-swift-IQ3_XXS"
+os.makedirs(target_dir, exist_ok=True)
+print(f"Target directory ready: {target_dir}")
+
+# Step 2: Install multi-connection parallel downloader (aria2)
+print("\n[2/5] Installing high-speed downloader (aria2)...")
+!apt-get update -qq && apt-get install -y -qq aria2
+
+# Step 3: Download Shard 1 (39.8 GB) with 16 parallel streams
+print("\n[3/5] Downloading Shard 1 (39.8 GB)...")
+!aria2c -x 16 -s 16 -k 1M -c \
+  "https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF/resolve/main/swift-IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf" \
+  -d "{target_dir}" \
+  -o "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf"
+
+# Step 4: Download Shard 2 (36.2 GB) with 16 parallel streams
+print("\n[4/5] Downloading Shard 2 (36.2 GB)...")
+!aria2c -x 16 -s 16 -k 1M -c \
+  "https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF/resolve/main/swift-IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf" \
+  -d "{target_dir}" \
+  -o "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf"
+
+# Step 5: Download Multimodal Vision Projector (900 MB)
+print("\n[5/5] Downloading Vision Projector (mmproj)...")
+!aria2c -x 16 -s 16 -k 1M -c \
+  "https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF/resolve/main/mmproj-Swift-Qwen3.8-Flash-Next-BF16.gguf" \
+  -d "{target_dir}" \
+  -o "mmproj-Swift-Qwen3.8-Flash-Next-BF16.gguf"
+
+# Verification & Summary
+print("\n" + "=" * 60)
+print("DOWNLOAD COMPLETE! Files saved permanently to Google Drive:")
+print("=" * 60)
+!ls -lh "{target_dir}"
