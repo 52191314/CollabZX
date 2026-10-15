@@ -864,31 +864,49 @@ HF_SHARDS = {
 }
 
 def _find_shard_on_drive(shard_name: str) -> Optional[pathlib.Path]:
-    """Searches Google Drive (including MyDrive, shortcuts, and Shared drives) for the GGUF shard."""
+    """Searches Google Drive (following shortcut symlinks and handling duplicate folder names like 'StrataModels (1)')."""
+    mydrive = pathlib.Path("/content/drive/MyDrive")
     candidates = [
         DRIVE_MODEL_DIR / shard_name,
-        pathlib.Path("/content/drive/MyDrive/huihui-swift-IQ3_XXS") / shard_name,
-        pathlib.Path("/content/drive/MyDrive/StrataModels") / shard_name,
-        pathlib.Path("/content/drive/MyDrive") / shard_name,
+        mydrive / "huihui-swift-IQ3_XXS" / shard_name,
+        mydrive / "StrataModels" / shard_name,
+        mydrive / shard_name,
     ]
+    # Also check any 'StrataModels (1)', 'StrataModels (2)' created when both a folder and a shortcut exist!
+    if mydrive.exists():
+        try:
+            for item in sorted(mydrive.iterdir()):
+                if item.name.startswith("StrataModels") or item.name.startswith("huihui"):
+                    candidates.append(item / "huihui-swift-IQ3_XXS" / shard_name)
+                    candidates.append(item / shard_name)
+        except Exception:
+            pass
+
     for c in candidates:
-        if c.exists() and c.stat().st_size > (1 << 30):
-            return c
+        try:
+            if c.exists() and c.stat().st_size > (1 << 30):
+                return c
+        except Exception:
+            pass
+
+    # Walk with followlinks=True so Google Drive shortcut symlinks (-> .shortcut-targets-by-id) are traversed!
     drive_root = pathlib.Path("/content/drive")
     if drive_root.exists():
-        for root_sub in ("MyDrive", ".shortcut-targets-by-id", "Shareddrives"):
+        for root_sub in ("MyDrive", "Shareddrives"):
             sub = drive_root / root_sub
             if sub.exists():
                 try:
-                    for found in sub.rglob(shard_name):
-                        if found.is_file() and found.stat().st_size > (1 << 30):
-                            return found
+                    for root, _dirs, files in os.walk(str(sub), followlinks=True):
+                        if shard_name in files:
+                            found = pathlib.Path(root) / shard_name
+                            if found.stat().st_size > (1 << 30):
+                                return found
                 except Exception:
                     pass
     return None
 
 def resolve_or_download_shard(shard_name: str) -> pathlib.Path:
-    """Finds shard on Google Drive (or local SSD), or downloads it if missing."""
+    """Finds shard on Google Drive (or local SSD), auto-remounting Drive if a shortcut was just added."""
     LOCAL_MODEL_DIR.mkdir(parents=True, exist_ok=True)
     local_path = LOCAL_MODEL_DIR / shard_name
 
@@ -897,6 +915,16 @@ def resolve_or_download_shard(shard_name: str) -> pathlib.Path:
         return local_path
 
     drive_path = _find_shard_on_drive(shard_name)
+    if drive_path is None and os.path.exists("/content/drive"):
+        # If the user just added the shortcut in Google Drive UI while Colab was already mounted, force remount to refresh FUSE cache!
+        try:
+            from google.colab import drive
+            print(f"      [Google Drive] Refreshing Drive mount to pick up new shortcuts for {shard_name}...")
+            drive.mount("/content/drive", force_remount=True)
+            drive_path = _find_shard_on_drive(shard_name)
+        except Exception:
+            pass
+
     if drive_path is not None:
         print(f"      [Google Drive] Found shard on Drive: {drive_path} ({drive_path.stat().st_size / 1e9:.2f} GB)")
         return stage_shard_to_local_ssd(drive_path, LOCAL_MODEL_DIR)
