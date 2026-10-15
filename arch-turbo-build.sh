@@ -190,13 +190,18 @@ echo " ✅ NATIVE ARCH LINUX STRATA BUILD COMPLETE!"
 echo "    - Binary : ${STRATA_DIR}/engine/strata (${VNNI_COUNT} AVX-VNNI instructions)"
 echo "    - Config : ${STRATA_DIR}/strata-huihui-swift-linux.json"
 echo ""
-echo "    To start Strata immediately with unlimited pinned memory:"
+echo "    To start Strata immediately with unlimited pinned memory & active OpenMP spin:"
 echo "      ulimit -l unlimited 2>/dev/null || true"
+echo "      export OMP_WAIT_POLICY=ACTIVE GOMP_SPINCOUNT=INFINITE CUDA_MODULE_LOADING=LAZY CUDA_DEVICE_MAX_CONNECTIONS=32"
 echo "      cd ${STRATA_DIR} && ./.venv/bin/python serve/server.py --engine strata --config strata-huihui-swift-linux.json --port 8080"
 echo "================================================================================"
 
 if [[ "${1:-}" == "--run" ]]; then
     ulimit -l unlimited 2>/dev/null || true
+    export OMP_WAIT_POLICY=ACTIVE
+    export GOMP_SPINCOUNT=INFINITE
+    export CUDA_MODULE_LOADING=LAZY
+    export CUDA_DEVICE_MAX_CONNECTIONS=32
     cd "${STRATA_DIR}"
     exec "${PY_BIN}" "${STRATA_DIR}/serve/server.py" \
         --engine strata \

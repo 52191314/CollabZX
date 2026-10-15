@@ -30,7 +30,10 @@ print("=" * 80)
 # 1. OS & LINUX VM KERNEL TUNING + DEPENDENCY INSTALLATION
 # ------------------------------------------------------------------------------
 def setup_cloud_machine():
-    print("\n[1/6] Customizing Colab Linux Kernel & VM Subsystem for 76 GB Zero-Copy Mmap...")
+    print("\n[1/6] Customizing Colab Linux Kernel, OpenMP Spin-Policy & VM Subsystem...")
+    # ik_llama.cpp trick: keep OpenMP worker threads hot across 48 layer transitions (no futex sleep!)
+    os.environ["OMP_WAIT_POLICY"] = "ACTIVE"
+    os.environ["GOMP_SPINCOUNT"] = "INFINITE"
     cmds = [
         "echo always > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true",
         "echo madvise > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || true",
@@ -86,11 +89,15 @@ CPP_SOURCE = r"""
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <immintrin.h>
 #include <omp.h>
 
 extern "C" {
 
 static inline float fp16_to_fp32(uint16_t h) {
+#if defined(__F16C__)
+    return _cvtsh_ss(h);
+#else
     const uint32_t sign = (uint32_t)(h >> 15) & 1u;
     uint32_t exp = (h >> 10) & 0x1Fu, man = h & 0x3FFu, f;
     if (exp == 0) {
@@ -106,6 +113,7 @@ static inline float fp16_to_fp32(uint16_t h) {
     float out;
     std::memcpy(&out, &f, 4);
     return out;
+#endif
 }
 
 static inline uint16_t fp32_to_bf16(float f) {
@@ -116,7 +124,9 @@ static inline uint16_t fp32_to_bf16(float f) {
 }
 
 static inline uint16_t read_u16(const uint8_t* p) {
-    return (uint16_t)(p[0] | (p[1] << 8));
+    uint16_t v;
+    std::memcpy(&v, p, 2);
+    return v;
 }
 
 static const int8_t kvalues_iq4nl[16] = {
@@ -193,7 +203,6 @@ void strata_dequant_q8_0(const uint8_t* src, float* dst, int64_t n_elems) {
 }
 
 // Fast OpenMP Per-Row Symmetric INT8 Quantizer for TPU v5e HBM
-// Converts float32 [rows, cols] -> int8 [rows, cols] + bf16_as_u16 scale [rows]
 void strata_f32_to_int8_rowwise(const float* src, int8_t* dst_q, uint16_t* dst_scale_bf16,
                                 int64_t rows, int64_t cols) {
     #pragma omp parallel for schedule(static)
@@ -208,7 +217,6 @@ void strata_f32_to_int8_rowwise(const float* src, int8_t* dst_q, uint16_t* dst_s
         float scale = (amax > 0.0f) ? (amax / 127.0f) : 1.0f;
         uint16_t s_bf16 = fp32_to_bf16(scale);
         dst_scale_bf16[r] = s_bf16;
-        // Reconstruct exact bf16 scale so quantization matches TPU dequantization
         uint32_t s_u32 = ((uint32_t)s_bf16) << 16;
         float exact_scale;
         std::memcpy(&exact_scale, &s_u32, 4);
@@ -222,59 +230,110 @@ void strata_f32_to_int8_rowwise(const float* src, int8_t* dst_q, uint16_t* dst_s
     }
 }
 
-static uint8_t g_iq2xxs[256 * 8];
-static uint8_t g_iq2xs[512 * 8];
-static uint8_t g_iq2s[1024 * 8];
-static uint8_t g_iq3xxs[256 * 4];
-static uint8_t g_iq3s[512 * 4];
 static uint8_t g_ksigns[128];
+alignas(16) static float g_iq3xxs_lut[16][256][4];
+alignas(16) static float g_iq3s_lut[16][512][4];
+alignas(16) static float g_iq2xxs_lo[16][256][4];
+alignas(16) static float g_iq2xxs_hi[16][256][4];
+alignas(16) static float g_iq2xs_lo[16][512][4];
+alignas(16) static float g_iq2xs_hi[16][512][4];
+alignas(16) static float g_iq2s_lo[16][1024][4];
+alignas(16) static float g_iq2s_hi[16][1024][4];
+alignas(16) static float g_q2_lut[256][4];
+alignas(16) static float g_iq4nl_f32[16];
 
-void strata_init_iq_grids(const uint8_t* p_iq2xxs, const uint8_t* p_iq2xs,
-                          const uint8_t* p_iq2s, const uint8_t* p_iq3xxs,
-                          const uint8_t* p_iq3s, const uint8_t* p_ksigns) {
-    std::memcpy(g_iq2xxs, p_iq2xxs, 256 * 8);
-    std::memcpy(g_iq2xs,  p_iq2xs,  512 * 8);
-    std::memcpy(g_iq2s,   p_iq2s,   1024 * 8);
-    std::memcpy(g_iq3xxs, p_iq3xxs, 256 * 4);
-    std::memcpy(g_iq3s,   p_iq3s,   512 * 4);
-    std::memcpy(g_ksigns, p_ksigns, 128);
+void strata_init_iq_grids(const uint8_t* p2xxs, const uint8_t* p2xs, const uint8_t* p2s,
+                          const uint8_t* p3xxs, const uint8_t* p3s, const uint8_t* psigns) {
+    std::memcpy(g_ksigns, psigns, 128);
+    for (int i = 0; i < 16; ++i) g_iq4nl_f32[i] = (float)kvalues_iq4nl[i];
+    for (int q = 0; q < 256; ++q) {
+        for (int k = 0; k < 4; ++k) {
+            g_q2_lut[q][k] = (float)((int)((q >> (2 * k)) & 3) - 1);
+        }
+    }
+    for (int s = 0; s < 16; ++s) {
+        float sf[4];
+        for (int k = 0; k < 4; ++k) sf[k] = (s & (1 << k)) ? -1.0f : 1.0f;
+        for (int g = 0; g < 256; ++g) {
+            for (int k = 0; k < 4; ++k) {
+                g_iq3xxs_lut[s][g][k] = (float)p3xxs[g * 4 + k] * sf[k];
+                g_iq2xxs_lo[s][g][k]  = (float)p2xxs[g * 8 + k] * sf[k];
+                g_iq2xxs_hi[s][g][k]  = (float)p2xxs[g * 8 + 4 + k] * sf[k];
+            }
+        }
+        for (int g = 0; g < 512; ++g) {
+            for (int k = 0; k < 4; ++k) {
+                g_iq3s_lut[s][g][k] = (float)p3s[g * 4 + k] * sf[k];
+                g_iq2xs_lo[s][g][k] = (float)p2xs[g * 8 + k] * sf[k];
+                g_iq2xs_hi[s][g][k] = (float)p2xs[g * 8 + 4 + k] * sf[k];
+            }
+        }
+        for (int g = 0; g < 1024; ++g) {
+            for (int k = 0; k < 4; ++k) {
+                g_iq2s_lo[s][g][k] = (float)p2s[g * 8 + k] * sf[k];
+                g_iq2s_hi[s][g][k] = (float)p2s[g * 8 + 4 + k] * sf[k];
+            }
+        }
+    }
 }
 
-static inline float strata_dot_row_raw(const uint8_t* row_ptr, int type_id,
-                                       const float* x, int64_t n_cols) {
+#if defined(__AVX2__) && defined(__FMA__)
+static inline float hsum256_ps(__m256 v) {
+    __m128 vlow  = _mm256_castps256_ps128(v);
+    __m128 vhigh = _mm256_extractf128_ps(v, 1);
+    vlow = _mm_add_ps(vlow, vhigh);
+    __m128 shuf = _mm_movehdup_ps(vlow);
+    __m128 sums = _mm_add_ps(vlow, shuf);
+    shuf = _mm_movehl_ps(shuf, sums);
+    sums = _mm_add_ss(sums, shuf);
+    return _mm_cvtss_f32(sums);
+}
+#endif
+
+static inline float strata_dot_row_raw(const uint8_t* __restrict__ row_ptr, int type_id,
+                                       const float* __restrict__ x, int64_t n_cols) {
     float row_acc = 0.0f;
-    if (type_id == 20) { // IQ4_NL (32 elems per 18B block)
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 row_v = _mm256_setzero_ps();
+    if (type_id == 20) {
         const int64_t nb = n_cols / 32;
         for (int64_t b = 0; b < nb; ++b) {
             const uint8_t* blk = row_ptr + b * 18;
-            const float d = fp16_to_fp32(read_u16(blk));
+            const __m256 vd = _mm256_set1_ps(fp16_to_fp32(read_u16(blk)));
             const uint8_t* qs = blk + 2;
             const float* xb = x + b * 32;
-            float s = 0.0f;
-            for (int j = 0; j < 16; ++j) {
-                s += (float)kvalues_iq4nl[qs[j] & 0x0F] * xb[j]
-                   + (float)kvalues_iq4nl[qs[j] >> 4]   * xb[j + 16];
+            __m256 acc = _mm256_setzero_ps();
+            for (int j = 0; j < 16; j += 4) {
+                alignas(32) float wlo[8] = {
+                    g_iq4nl_f32[qs[j+0] & 0x0F], g_iq4nl_f32[qs[j+1] & 0x0F],
+                    g_iq4nl_f32[qs[j+2] & 0x0F], g_iq4nl_f32[qs[j+3] & 0x0F],
+                    g_iq4nl_f32[qs[j+0] >> 4],   g_iq4nl_f32[qs[j+1] >> 4],
+                    g_iq4nl_f32[qs[j+2] >> 4],   g_iq4nl_f32[qs[j+3] >> 4]
+                };
+                __m256 vx = _mm256_set_m128(_mm_loadu_ps(xb + j + 16), _mm_loadu_ps(xb + j));
+                acc = _mm256_fmadd_ps(_mm256_load_ps(wlo), vx, acc);
             }
-            row_acc += d * s;
+            row_v = _mm256_fmadd_ps(vd, acc, row_v);
         }
-    } else if (type_id == 42) { // Q2_0 (64 elems per 18B block)
+        return hsum256_ps(row_v);
+    } else if (type_id == 42) {
         const int64_t nb = n_cols / 64;
         for (int64_t b = 0; b < nb; ++b) {
             const uint8_t* blk = row_ptr + b * 18;
-            const float d = fp16_to_fp32(read_u16(blk));
+            const __m256 vd = _mm256_set1_ps(fp16_to_fp32(read_u16(blk)));
             const uint8_t* qs = blk + 2;
             const float* xb = x + b * 64;
-            float s = 0.0f;
-            for (int j = 0; j < 16; ++j) {
-                uint8_t q = qs[j];
-                s += (float)((int)(q & 3) - 1)        * xb[j * 4 + 0]
-                   + (float)((int)((q >> 2) & 3) - 1) * xb[j * 4 + 1]
-                   + (float)((int)((q >> 4) & 3) - 1) * xb[j * 4 + 2]
-                   + (float)((int)((q >> 6) & 3) - 1) * xb[j * 4 + 3];
+            __m256 acc = _mm256_setzero_ps();
+            for (int j = 0; j < 16; j += 2) {
+                __m128 va = _mm_load_ps(g_q2_lut[qs[j]]);
+                __m128 vb = _mm_load_ps(g_q2_lut[qs[j + 1]]);
+                __m256 v8 = _mm256_set_m128(vb, va);
+                acc = _mm256_fmadd_ps(v8, _mm256_loadu_ps(xb + j * 4), acc);
             }
-            row_acc += d * s;
+            row_v = _mm256_fmadd_ps(vd, acc, row_v);
         }
-    } else if (type_id == 18) { // IQ3_XXS (256 elems per 98B block)
+        return hsum256_ps(row_v);
+    } else if (type_id == 18) {
         const int64_t nb = n_cols / 256;
         for (int64_t b = 0; b < nb; ++b) {
             const uint8_t* blk = row_ptr + b * 98;
@@ -283,26 +342,21 @@ static inline float strata_dot_row_raw(const uint8_t* row_ptr, int type_id,
             const uint8_t* scales = blk + 66;
             const float* xb = x + b * 256;
             for (int ib = 0; ib < 8; ++ib) {
-                uint32_t sw;
-                std::memcpy(&sw, scales + ib * 4, 4);
-                const float db = d * (0.5f + (float)(sw >> 28)) * 0.5f;
+                uint32_t sw; std::memcpy(&sw, scales + ib * 4, 4);
+                const __m256 vdb = _mm256_set1_ps(d * (0.5f + (float)(sw >> 28)) * 0.5f);
                 const float* x_sub = xb + ib * 32;
-                float sum32 = 0.0f;
+                __m256 sum32 = _mm256_setzero_ps();
                 for (int l = 0; l < 4; ++l) {
                     const uint8_t sbits = g_ksigns[(sw >> (7 * l)) & 0x7F];
-                    const uint8_t* g4a = g_iq3xxs + (uint32_t)qs[ib * 8 + 2 * l + 0] * 4;
-                    const uint8_t* g4b = g_iq3xxs + (uint32_t)qs[ib * 8 + 2 * l + 1] * 4;
-                    for (int k = 0; k < 4; ++k) {
-                        float sa = (sbits & (1u << k)) ? -1.0f : 1.0f;
-                        float sb = (sbits & (1u << (k + 4))) ? -1.0f : 1.0f;
-                        sum32 += (float)g4a[k] * sa * x_sub[l * 8 + k]
-                               + (float)g4b[k] * sb * x_sub[l * 8 + k + 4];
-                    }
+                    __m128 va = _mm_load_ps(g_iq3xxs_lut[sbits & 0x0F][qs[ib*8 + 2*l + 0]]);
+                    __m128 vb = _mm_load_ps(g_iq3xxs_lut[sbits >> 4][qs[ib*8 + 2*l + 1]]);
+                    sum32 = _mm256_fmadd_ps(_mm256_set_m128(vb, va), _mm256_loadu_ps(x_sub + l * 8), sum32);
                 }
-                row_acc += db * sum32;
+                row_v = _mm256_fmadd_ps(vdb, sum32, row_v);
             }
         }
-    } else if (type_id == 21) { // IQ3_S (256 elems per 110B block)
+        return hsum256_ps(row_v);
+    } else if (type_id == 21) {
         const int64_t nb = n_cols / 256;
         for (int64_t b = 0; b < nb; ++b) {
             const uint8_t* blk = row_ptr + b * 110;
@@ -314,27 +368,23 @@ static inline float strata_dot_row_raw(const uint8_t* row_ptr, int type_id,
             const float* xb = x + b * 256;
             for (int ib = 0; ib < 8; ++ib) {
                 uint8_t sc = (ib & 1) ? (scales[ib >> 1] >> 4) : (scales[ib >> 1] & 0x0F);
-                const float db = d * (float)(1 + 2 * (int)sc);
+                const __m256 vdb = _mm256_set1_ps(d * (float)(1 + 2 * (int)sc));
                 const uint8_t qhb = qh[ib];
                 const float* x_sub = xb + ib * 32;
-                float sum32 = 0.0f;
+                __m256 sum32 = _mm256_setzero_ps();
                 for (int l = 0; l < 4; ++l) {
                     const uint8_t sbits = signs[ib * 4 + l];
-                    const uint16_t idxa = (uint16_t)qs[ib * 8 + 2 * l + 0] | (((uint16_t)((qhb >> (2 * l + 0)) & 1u)) << 8);
-                    const uint16_t idxb = (uint16_t)qs[ib * 8 + 2 * l + 1] | (((uint16_t)((qhb >> (2 * l + 1)) & 1u)) << 8);
-                    const uint8_t* g4a = g_iq3s + (uint32_t)idxa * 4;
-                    const uint8_t* g4b = g_iq3s + (uint32_t)idxb * 4;
-                    for (int k = 0; k < 4; ++k) {
-                        float sa = (sbits & (1u << k)) ? -1.0f : 1.0f;
-                        float sb = (sbits & (1u << (k + 4))) ? -1.0f : 1.0f;
-                        sum32 += (float)g4a[k] * sa * x_sub[l * 8 + k]
-                               + (float)g4b[k] * sb * x_sub[l * 8 + k + 4];
-                    }
+                    const uint16_t idxa = (uint16_t)qs[ib*8 + 2*l + 0] | (((uint16_t)((qhb >> (2*l + 0)) & 1u)) << 8);
+                    const uint16_t idxb = (uint16_t)qs[ib*8 + 2*l + 1] | (((uint16_t)((qhb >> (2*l + 1)) & 1u)) << 8);
+                    __m128 va = _mm_load_ps(g_iq3s_lut[sbits & 0x0F][idxa]);
+                    __m128 vb = _mm_load_ps(g_iq3s_lut[sbits >> 4][idxb]);
+                    sum32 = _mm256_fmadd_ps(_mm256_set_m128(vb, va), _mm256_loadu_ps(x_sub + l * 8), sum32);
                 }
-                row_acc += db * sum32;
+                row_v = _mm256_fmadd_ps(vdb, sum32, row_v);
             }
         }
-    } else if (type_id == 16) { // IQ2_XXS (256 elems per 66B block)
+        return hsum256_ps(row_v);
+    } else if (type_id == 16) {
         const int64_t nb = n_cols / 256;
         for (int64_t b = 0; b < nb; ++b) {
             const uint8_t* blk = row_ptr + b * 66;
@@ -343,23 +393,22 @@ static inline float strata_dot_row_raw(const uint8_t* row_ptr, int type_id,
             const float* xb = x + b * 256;
             for (int ib = 0; ib < 8; ++ib) {
                 const uint8_t* q = qs + ib * 8;
-                uint32_t w1;
-                std::memcpy(&w1, q + 4, 4);
-                const float db = d * (0.5f + (float)(w1 >> 28)) * 0.25f;
+                uint32_t w1; std::memcpy(&w1, q + 4, 4);
+                const __m256 vdb = _mm256_set1_ps(d * (0.5f + (float)(w1 >> 28)) * 0.25f);
                 const float* x_sub = xb + ib * 32;
-                float sum32 = 0.0f;
+                __m256 sum32 = _mm256_setzero_ps();
                 for (int l = 0; l < 4; ++l) {
-                    const uint8_t* g8 = g_iq2xxs + (uint32_t)q[l] * 8;
                     const uint8_t sbits = g_ksigns[(w1 >> (7 * l)) & 0x7F];
-                    for (int k = 0; k < 8; ++k) {
-                        float s = (sbits & (1u << k)) ? -1.0f : 1.0f;
-                        sum32 += (float)g8[k] * s * x_sub[l * 8 + k];
-                    }
+                    const uint8_t gidx = q[l];
+                    __m128 vlo = _mm_load_ps(g_iq2xxs_lo[sbits & 0x0F][gidx]);
+                    __m128 vhi = _mm_load_ps(g_iq2xxs_hi[sbits >> 4][gidx]);
+                    sum32 = _mm256_fmadd_ps(_mm256_set_m128(vhi, vlo), _mm256_loadu_ps(x_sub + l * 8), sum32);
                 }
-                row_acc += db * sum32;
+                row_v = _mm256_fmadd_ps(vdb, sum32, row_v);
             }
         }
-    } else if (type_id == 17) { // IQ2_XS (256 elems per 74B block)
+        return hsum256_ps(row_v);
+    } else if (type_id == 17) {
         const int64_t nb = n_cols / 256;
         for (int64_t b = 0; b < nb; ++b) {
             const uint8_t* blk = row_ptr + b * 74;
@@ -369,22 +418,22 @@ static inline float strata_dot_row_raw(const uint8_t* row_ptr, int type_id,
             const float* xb = x + b * 256;
             for (int ib = 0; ib < 16; ++ib) {
                 uint8_t sc = (ib & 1) ? (scales[ib >> 1] >> 4) : (scales[ib >> 1] & 0x0F);
-                const float db = d * (0.5f + (float)sc) * 0.25f;
+                const __m256 vdb = _mm256_set1_ps(d * (0.5f + (float)sc) * 0.25f);
                 const float* x_sub = xb + ib * 16;
-                float sum16 = 0.0f;
+                __m256 sum16 = _mm256_setzero_ps();
                 for (int l = 0; l < 2; ++l) {
                     uint16_t qw = read_u16(qs + (ib * 2 + l) * 2);
-                    const uint8_t* g8 = g_iq2xs + (uint32_t)(qw & 511u) * 8;
+                    const uint16_t gidx = qw & 511u;
                     const uint8_t sbits = g_ksigns[qw >> 9];
-                    for (int k = 0; k < 8; ++k) {
-                        float s = (sbits & (1u << k)) ? -1.0f : 1.0f;
-                        sum16 += (float)g8[k] * s * x_sub[l * 8 + k];
-                    }
+                    __m128 vlo = _mm_load_ps(g_iq2xs_lo[sbits & 0x0F][gidx]);
+                    __m128 vhi = _mm_load_ps(g_iq2xs_hi[sbits >> 4][gidx]);
+                    sum16 = _mm256_fmadd_ps(_mm256_set_m128(vhi, vlo), _mm256_loadu_ps(x_sub + l * 8), sum16);
                 }
-                row_acc += db * sum16;
+                row_v = _mm256_fmadd_ps(vdb, sum16, row_v);
             }
         }
-    } else if (type_id == 22) { // IQ2_S (256 elems per 82B block)
+        return hsum256_ps(row_v);
+    } else if (type_id == 22) {
         const int64_t nb = n_cols / 256;
         for (int64_t b = 0; b < nb; ++b) {
             const uint8_t* blk = row_ptr + b * 82;
@@ -396,86 +445,61 @@ static inline float strata_dot_row_raw(const uint8_t* row_ptr, int type_id,
             const float* xb = x + b * 256;
             for (int ib = 0; ib < 16; ++ib) {
                 uint8_t sc = (ib & 1) ? (scales[ib >> 1] >> 4) : (scales[ib >> 1] & 0x0F);
-                const float db = d * (0.5f + (float)sc) * 0.25f;
+                const __m256 vdb = _mm256_set1_ps(d * (0.5f + (float)sc) * 0.25f);
                 const float* x_sub = xb + ib * 16;
-                float sum16 = 0.0f;
+                __m256 sum16 = _mm256_setzero_ps();
                 for (int l = 0; l < 2; ++l) {
                     int idx32 = ib * 2 + l;
                     uint16_t gidx = (uint16_t)qs[idx32] | ((uint16_t)((qh[idx32 >> 2] >> (2 * (idx32 & 3))) & 0x03) << 8);
-                    const uint8_t* g8 = g_iq2s + (uint32_t)gidx * 8;
                     const uint8_t sbits = signs[idx32];
-                    for (int k = 0; k < 8; ++k) {
-                        float s = (sbits & (1u << k)) ? -1.0f : 1.0f;
-                        sum16 += (float)g8[k] * s * x_sub[l * 8 + k];
-                    }
+                    __m128 vlo = _mm_load_ps(g_iq2s_lo[sbits & 0x0F][gidx]);
+                    __m128 vhi = _mm_load_ps(g_iq2s_hi[sbits >> 4][gidx]);
+                    sum16 = _mm256_fmadd_ps(_mm256_set_m128(vhi, vlo), _mm256_loadu_ps(x_sub + l * 8), sum16);
                 }
-                row_acc += db * sum16;
+                row_v = _mm256_fmadd_ps(vdb, sum16, row_v);
             }
         }
-    } else if (type_id == 23) { // IQ4_XS (256 elems per 136B block)
-        const int64_t nb = n_cols / 256;
-        for (int64_t b = 0; b < nb; ++b) {
-            const uint8_t* blk = row_ptr + b * 136;
-            const float d = fp16_to_fp32(read_u16(blk));
-            const uint16_t scales_h = read_u16(blk + 2);
-            const uint8_t* scales_l = blk + 4;
-            const uint8_t* qs = blk + 8;
-            const float* xb = x + b * 256;
-            for (int ib = 0; ib < 8; ++ib) {
-                const int ls = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0F) | (((scales_h >> (2 * ib)) & 3) << 4);
-                const float dl = d * (float)(ls - 32);
-                const float* x_sub = xb + ib * 32;
-                const uint8_t* q_sub = qs + ib * 16;
-                float sum32 = 0.0f;
-                for (int j = 0; j < 16; ++j) {
-                    sum32 += (float)kvalues_iq4nl[q_sub[j] & 0x0F] * x_sub[j]
-                           + (float)kvalues_iq4nl[q_sub[j] >> 4]   * x_sub[j + 16];
-                }
-                row_acc += dl * sum32;
-            }
-        }
-    } else if (type_id == 8) { // Q8_0 (32 elems per 34B block)
-        const int64_t nb = n_cols / 32;
-        for (int64_t b = 0; b < nb; ++b) {
-            const uint8_t* blk = row_ptr + b * 34;
-            const float d = fp16_to_fp32(read_u16(blk));
-            const int8_t* qs = (const int8_t*)(blk + 2);
-            const float* xb = x + b * 32;
-            float s = 0.0f;
-            for (int j = 0; j < 32; ++j) s += (float)qs[j] * xb[j];
-            row_acc += d * s;
-        }
+        return hsum256_ps(row_v);
     }
+#endif
     return row_acc;
 }
 
-// Zero-allocation OpenMP Direct Compressed Expert Evaluator
-void strata_eval_expert_raw(const float* x,
-                            const uint8_t* g_raw, int64_t g_bytes, int g_type,
-                            const uint8_t* u_raw, int64_t u_bytes, int u_type,
-                            const uint8_t* d_raw, int64_t d_bytes, int d_type,
-                            float weight, float* out) {
-    const int64_t g_row_bytes = g_bytes / 640;
-    const int64_t u_row_bytes = u_bytes / 640;
-    const int64_t d_row_bytes = d_bytes / 2560;
-    float hidden[640];
-    #pragma omp parallel for schedule(static)
-    for (int64_t r = 0; r < 640; ++r) {
-        float g_acc = strata_dot_row_raw(g_raw + r * g_row_bytes, g_type, x, 2560);
-        float u_acc = strata_dot_row_raw(u_raw + r * u_row_bytes, u_type, x, 2560);
-        float silu_g = g_acc / (1.0f + std::exp(-g_acc));
-        hidden[r] = silu_g * u_acc;
-    }
-    #pragma omp parallel for schedule(static)
-    for (int64_t r = 0; r < 2560; ++r) {
-        float d_acc = strata_dot_row_raw(d_raw + r * d_row_bytes, d_type, hidden, 640);
-        out[r] += weight * d_acc;
+void strata_eval_experts_batch(
+    const float* __restrict__ x,
+    int n_exp,
+    const uint8_t* const* __restrict__ g_ptrs, const int64_t* __restrict__ g_bytes, const int* __restrict__ g_types,
+    const uint8_t* const* __restrict__ u_ptrs, const int64_t* __restrict__ u_bytes, const int* __restrict__ u_types,
+    const uint8_t* const* __restrict__ d_ptrs, const int64_t* __restrict__ d_bytes, const int* __restrict__ d_types,
+    const float* __restrict__ weights,
+    float* __restrict__ out
+) {
+    alignas(32) float hidden[10][640];
+    #pragma omp parallel
+    {
+        #pragma omp for collapse(2) schedule(static)
+        for (int e = 0; e < n_exp; ++e) {
+            for (int64_t r = 0; r < 640; ++r) {
+                const int64_t g_rb = g_bytes[e] / 640;
+                const int64_t u_rb = u_bytes[e] / 640;
+                float ga = strata_dot_row_raw(g_ptrs[e] + r * g_rb, g_types[e], x, 2560);
+                float ua = strata_dot_row_raw(u_ptrs[e] + r * u_rb, u_types[e], x, 2560);
+                hidden[e][r] = (ga / (1.0f + std::exp(-ga))) * ua;
+            }
+        }
+        #pragma omp for schedule(static)
+        for (int64_t r = 0; r < 2560; ++r) {
+            float acc = 0.0f;
+            for (int e = 0; e < n_exp; ++e) {
+                const int64_t d_rb = d_bytes[e] / 2560;
+                acc += weights[e] * strata_dot_row_raw(d_ptrs[e] + r * d_rb, d_types[e], hidden[e], 640);
+            }
+            out[r] = acc;
+        }
     }
 }
 
-
 // Layer 1 Per-Layer Token Embedding (PLE) 64-bit XOR N-gram Hash & IQ4_NL Gather
-// Exact transcription of Strata's src/kernels/ngram.cpp
 void strata_ple_ngram_gather(int32_t token, int32_t prev0_oldest, int32_t prev1_newest,
                              const uint8_t* table_base, int table_type, float* out2560) {
     static const uint64_t mult[3] = {
@@ -510,8 +534,6 @@ void strata_ple_ngram_gather(int32_t token, int32_t prev0_oldest, int32_t prev1_
         }
     }
 
-    // Gather 16 rows of 160 elements = 2560 floats
-    // In IQ4_NL (type 20), each 160-element row is 5 blocks of 32 = 90 bytes
     #pragma omp parallel for schedule(static)
     for (int h = 0; h < 16; ++h) {
         float* head_out = out2560 + h * 160;
@@ -527,7 +549,6 @@ void strata_ple_ngram_gather(int32_t token, int32_t prev0_oldest, int32_t prev1_
                 }
             }
         } else if (table_type == 8) {
-            // Q8_0 (170 bytes per 160-elem row)
             const uint8_t* row_ptr = table_base + (uint64_t)rows[h] * 170ull;
             for (int b = 0; b < 5; ++b) {
                 const uint8_t* blk = row_ptr + b * 34;
@@ -546,8 +567,8 @@ print("\n[2/6] Compiling Strata C++/OpenMP Bridge (/tmp/libstrata_tpu.so)...")
 with open("/tmp/strata_tpu_bridge.cpp", "w") as f:
     f.write(CPP_SOURCE)
 subprocess.run(
-    ["g++", "-O3", "-march=native", "-fopenmp", "-shared", "-fPIC",
-     "/tmp/strata_tpu_bridge.cpp", "-o", "/tmp/libstrata_tpu.so"],
+    ["g++", "-O3", "-march=native", "-mavx2", "-mfma", "-mf16c", "-ffast-math", "-funroll-loops",
+     "-fopenmp", "-shared", "-fPIC", "/tmp/strata_tpu_bridge.cpp", "-o", "/tmp/libstrata_tpu.so"],
     check=True
 )
 LIB_STRATA = ctypes.CDLL("/tmp/libstrata_tpu.so")
@@ -563,12 +584,12 @@ LIB_STRATA.strata_init_iq_grids.argtypes = [
     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p
 ]
-LIB_STRATA.strata_eval_expert_raw.argtypes = [
-    ctypes.c_void_p,
-    ctypes.c_void_p, ctypes.c_int64, ctypes.c_int,
-    ctypes.c_void_p, ctypes.c_int64, ctypes.c_int,
-    ctypes.c_void_p, ctypes.c_int64, ctypes.c_int,
-    ctypes.c_float, ctypes.c_void_p
+LIB_STRATA.strata_eval_experts_batch.argtypes = [
+    ctypes.c_void_p, ctypes.c_int,
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.c_void_p, ctypes.c_void_p
 ]
 LIB_STRATA.strata_ple_ngram_gather.argtypes = [
     ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
@@ -591,7 +612,7 @@ LIB_STRATA.strata_init_iq_grids(
     _g_iq3s.ctypes.data_as(ctypes.c_void_p),
     _g_ksigns.ctypes.data_as(ctypes.c_void_p),
 )
-print("      Compiled libstrata_tpu.so with OpenMP + Direct IQ2/IQ3/IQ4/Q2_0 Expert Kernels!")
+print("      Compiled libstrata_tpu.so with AVX2/FMA L2 LUTs + Batched OpenMP Expert Kernels!")
 
 
 # ------------------------------------------------------------------------------
@@ -1118,15 +1139,42 @@ def moe_route_and_shared_jit(mixed: jax.Array, w_router: jax.Array, w_ginp: jax.
     return top_ids, top_weights, sh_out
 
 @jax.jit
-def eval_cached_expert_tpu_jit(mixed: jax.Array,
-                               gate_q: jax.Array, gate_s: jax.Array,
-                               up_q: jax.Array, up_s: jax.Array,
-                               down_q: jax.Array, down_s: jax.Array) -> jax.Array:
-    """Evaluates one INT8-cached routed expert on TPU v5e MXU."""
-    g = tpu_int8_matvec(gate_q, gate_s, mixed)
-    u = tpu_int8_matvec(up_q, up_s, mixed)
-    h = jax.nn.silu(g) * u
-    return tpu_int8_matvec(down_q, down_s, h)
+def _fused_qsa_layer_jit(R, pos, cos_row, sin_row, k_cache, v_cache,
+                         hc_a_norm, hc_a_down, hc_a_up, hc_a_inj,
+                         wq_q, wq_s, wk_q, wk_s, wv_q, wv_s, wo_q, wo_s, w_qnorm, w_knorm,
+                         hc_f_norm, hc_f_down, hc_f_up, hc_f_inj,
+                         w_router, w_ginp, sgate_q, sgate_s, sup_q, sup_s, sdown_q, sdown_s):
+    mixed_a, inj_a = gr_read_jit(R, hc_a_norm, hc_a_down, hc_a_up, hc_a_inj)
+    blk_out, k_cache, v_cache = qsa_layer_jit(
+        mixed_a, pos, cos_row, sin_row, k_cache, v_cache,
+        wq_q, wq_s, wk_q, wk_s, wv_q, wv_s, wo_q, wo_s, w_qnorm, w_knorm
+    )
+    R = gr_write_jit(R, blk_out, inj_a)
+    mixed_f, inj_f = gr_read_jit(R, hc_f_norm, hc_f_down, hc_f_up, hc_f_inj)
+    top_ids, top_weights, sh_out = moe_route_and_shared_jit(
+        mixed_f, w_router, w_ginp, sgate_q, sgate_s, sup_q, sup_s, sdown_q, sdown_s
+    )
+    R_sh = gr_write_jit(R, sh_out, inj_f)
+    return R, R_sh, mixed_f, inj_f, sh_out, top_ids, top_weights, k_cache, v_cache
+
+@jax.jit
+def _fused_gdn_layer_jit(R, conv_state, ssm_state,
+                         hc_a_norm, hc_a_down, hc_a_up, hc_a_inj,
+                         wqkv_q, wqkv_s, w_conv, w_alpha, w_beta, ssm_a, ssm_dt, wgate_q, wgate_s, w_snorm, wout_q, wout_s,
+                         hc_f_norm, hc_f_down, hc_f_up, hc_f_inj,
+                         w_router, w_ginp, sgate_q, sgate_s, sup_q, sup_s, sdown_q, sdown_s):
+    mixed_a, inj_a = gr_read_jit(R, hc_a_norm, hc_a_down, hc_a_up, hc_a_inj)
+    blk_out, conv_state, ssm_state = gdn_layer_jit(
+        mixed_a, conv_state, ssm_state,
+        wqkv_q, wqkv_s, w_conv, w_alpha, w_beta, ssm_a, ssm_dt, wgate_q, wgate_s, w_snorm, wout_q, wout_s
+    )
+    R = gr_write_jit(R, blk_out, inj_a)
+    mixed_f, inj_f = gr_read_jit(R, hc_f_norm, hc_f_down, hc_f_up, hc_f_inj)
+    top_ids, top_weights, sh_out = moe_route_and_shared_jit(
+        mixed_f, w_router, w_ginp, sgate_q, sgate_s, sup_q, sup_s, sdown_q, sdown_s
+    )
+    R_sh = gr_write_jit(R, sh_out, inj_f)
+    return R, R_sh, mixed_f, inj_f, sh_out, top_ids, top_weights, conv_state, ssm_state
 
 @jax.jit
 def lm_head_jit(R: jax.Array, w_norm: jax.Array, w_down: jax.Array,
@@ -1138,11 +1186,11 @@ def lm_head_jit(R: jax.Array, w_norm: jax.Array, w_down: jax.Array,
     return logits
 
 # ------------------------------------------------------------------------------
-# 6. STRATA-TPU ENGINE: WEIGHT LOADER, HBM EXPERT CACHE & FORWARD LOOP
+# 6. STRATA-TPU ENGINE: WEIGHT LOADER, HYBRID SSD/RAM CACHE & FORWARD LOOP
 # ------------------------------------------------------------------------------
 class StrataTPUEngine:
     def __init__(self, shard1_path: pathlib.Path, shard2_path: pathlib.Path,
-                 max_ctx: int = 4096, hbm_expert_slots: int = 1024):
+                 max_ctx: int = 4096, hbm_expert_slots: int = 0):
         self.max_ctx = max_ctx
         self.hbm_expert_slots = hbm_expert_slots
         print(f"\n[3/6] Parsing GGUF v3 Headers & Mmapping 76 GB Shards...")
@@ -1155,6 +1203,17 @@ class StrataTPUEngine:
         self.g2 = GGUFFile(shard2_path)
         self.mm1 = np.memmap(shard1_path, dtype=np.uint8, mode="r")
         self.mm2 = np.memmap(shard2_path, dtype=np.uint8, mode="r")
+
+        # r/LocalLLaMA kernel trick: madvise(MADV_RANDOM=1) on local SSD mmaps
+        # disables wasteful 128KB-2MB kernel read-ahead on sparse MoE expert seeks!
+        try:
+            _libc = ctypes.CDLL("libc.so.6")
+            _libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+            for _g, _mm in [(self.g1, self.mm1), (self.g2, self.mm2)]:
+                if not str(_g.path).startswith("/content/drive"):
+                    _libc.madvise(ctypes.c_void_p(_mm.ctypes.data), ctypes.c_size_t(_mm.nbytes), ctypes.c_int(1))
+        except Exception:
+            pass
 
         self.where: Dict[str, Tuple[GGUFFile, TensorInfo, np.memmap]] = {}
         for g, mm in [(self.g1, self.mm1), (self.g2, self.mm2)]:
@@ -1187,14 +1246,54 @@ class StrataTPUEngine:
         self.expert_info: List[Dict[str, Any]] = []
         self._load_dense_backbone_to_tpu()
 
-        # Initialize Dynamic LRU Expert Cache in TPU HBM
-        # Key: (layer, expert_id) -> (gate_q, gate_s, up_q, up_s, down_q, down_s) on TPU HBM
+        # Sequentially pin any remaining Drive-backed expert layers into Host RAM
+        self._pin_drive_layers_to_ram()
+
+        # Initialize Compressed Host RAM Expert Cache
         self.expert_cache: OrderedDict[Tuple[int, int], Tuple[jax.Array, ...]] = OrderedDict()
+        self.ram_expert_cache: OrderedDict[Tuple[int, int], Any] = OrderedDict()
+        self.ram_expert_slots = int(os.environ.get("STRATA_RAM_EXPERT_SLOTS", "8000"))
         self.cache_hits = 0
         self.cache_misses = 0
 
         # Allocate Recurrent Session State on TPU HBM
         self.reset_state()
+
+    def _pin_drive_layers_to_ram(self):
+        """Sequentially pins Drive-backed expert layers into contiguous Host RAM arrays so 0 seeks hit Google Drive FUSE."""
+        drive_mm_ids = set()
+        for g_obj, mm_obj in [(self.g1, self.mm1), (self.g2, self.mm2)]:
+            if str(g_obj.path).startswith("/content/drive"):
+                drive_mm_ids.add(id(mm_obj))
+        if not drive_mm_ids:
+            return
+        max_pin_bytes = int(float(os.environ.get("STRATA_RAM_PIN_GB", "24.0")) * (1 << 30))
+        pinned_bytes = 0
+        pinned_layers = 0
+        print(f"      -> Sequentially pinning Drive-backed expert layers into Host RAM (cap {max_pin_bytes/(1<<30):.1f} GB)...")
+        t_pin = time.time()
+        for l in range(len(self.expert_info)):
+            info = self.expert_info[l]
+            g_mm, g_base, g_bytes, g_type = info["gate"]
+            if id(g_mm) not in drive_mm_ids:
+                continue
+            u_mm, u_base, u_bytes, u_type = info["up"]
+            d_mm, d_base, d_bytes, d_type = info["down"]
+            layer_bytes = 512 * (g_bytes + u_bytes + d_bytes)
+            if pinned_bytes + layer_bytes > max_pin_bytes:
+                break
+            g_ram = np.array(g_mm[g_base : g_base + 512 * g_bytes], dtype=np.uint8, copy=True)
+            u_ram = np.array(u_mm[u_base : u_base + 512 * u_bytes], dtype=np.uint8, copy=True)
+            d_ram = np.array(d_mm[d_base : d_base + 512 * d_bytes], dtype=np.uint8, copy=True)
+            info["gate"] = (g_ram, 0, g_bytes, g_type)
+            info["up"]   = (u_ram, 0, u_bytes, u_type)
+            info["down"] = (d_ram, 0, d_bytes, d_type)
+            pinned_bytes += layer_bytes
+            pinned_layers += 1
+            if pinned_layers % 4 == 0:
+                dt = max(time.time() - t_pin, 1e-3)
+                print(f"         Pinned {pinned_layers} Drive layers ({pinned_bytes/1e9:.2f} GB) in Host RAM ({pinned_bytes/1e6/dt:.1f} MB/s)")
+        print(f"      -> Pinned {pinned_layers} layers ({pinned_bytes/1e9:.2f} GB) into Host RAM in {time.time()-t_pin:.1f}s!")
 
     def _raw_slice(self, name: str) -> Tuple[np.ndarray, TensorInfo]:
         g, t, mm = self.where[name]
@@ -1231,7 +1330,6 @@ class StrataTPUEngine:
             "norm_query": self._load_tpu_f32("blk.1.ple_norm_query.weight", (10240,)),
             "norm_conv": self._load_tpu_f32("blk.1.ple_norm_conv.weight", (10240,)),
         }
-        # ple_conv1d has GGUF shape [4, 10240] with ne0=4 fastest -> reshape(10240, 4).T -> (4, 10240)
         ple_conv_f32, _ = self._load_f32("blk.1.ple_conv1d.weight")
         self.ple_weights["conv1d"] = f32_to_tpu_f32(
             ple_conv_f32.reshape(10240, 4).T.copy(), (4, 10240)
@@ -1242,7 +1340,6 @@ class StrataTPUEngine:
             is_qsa = (l % 4 == 3)
             lw: Dict[str, Any] = {"is_qsa": is_qsa}
 
-            # Hyper-connection weights (hc_attn_* and hc_ffn_*)
             for h_prefix in ("hc_attn_", "hc_ffn_"):
                 lw[h_prefix + "norm"] = self._load_tpu_f32(p + h_prefix + "norm.weight", (4, 2560))
                 lw[h_prefix + "down"] = self._load_tpu_bf16(p + h_prefix + "down.weight", (320, 10240))
@@ -1268,7 +1365,6 @@ class StrataTPUEngine:
                 lw["ssm_norm"] = self._load_tpu_f32(p + "ssm_norm.weight", (128,))
                 lw["out"] = self._load_tpu_int8(p + "ssm_out.weight", 2560, 6144)
 
-            # MoE Router + Shared Expert
             lw["router"] = self._load_tpu_bf16(p + "ffn_gate_inp.weight", (512, 2560))
             lw["ginp"] = self._load_tpu_bf16(p + "ffn_gate_inp_shexp.weight", (2560,))
             lw["sgate"] = self._load_tpu_int8(p + "ffn_gate_shexp.weight", 640, 2560)
@@ -1276,7 +1372,6 @@ class StrataTPUEngine:
             lw["sdown"] = self._load_tpu_int8(p + "ffn_down_shexp.weight", 2560, 640)
             self.layers.append(lw)
 
-            # Record zero-copy mmap pointers for the 512 routed experts of layer l
             g_g, g_t, g_mm = self.where[p + "ffn_gate_exps.weight"]
             u_g, u_t, u_mm = self.where[p + "ffn_up_exps.weight"]
             d_g, d_t, d_mm = self.where[p + "ffn_down_exps.weight"]
@@ -1300,7 +1395,7 @@ class StrataTPUEngine:
     def reset_state(self):
         tpu_dev = jax.devices()[0]
         self.pos = 0
-        self.prev_tokens = [-1, -1]  # [oldest, newest] for Layer 1 PLE N-gram hash
+        self.prev_tokens = [-1, -1]
         self.ple_hist = jax.device_put(jnp.zeros((9, 10240), dtype=jnp.float32), tpu_dev)
         self.gdn_conv_states = {}
         self.gdn_ssm_states = {}
@@ -1341,17 +1436,24 @@ class StrataTPUEngine:
         return f32_to_tpu_f32(out_f32, (2560,))
 
     def _get_raw_expert_cached(self, layer: int, exp_id: int) -> Tuple[np.ndarray, int, int, np.ndarray, int, int, np.ndarray, int, int]:
-        if not hasattr(self, "ram_expert_cache"):
-            self.ram_expert_cache = OrderedDict()
-            self.ram_expert_slots = int(os.environ.get("STRATA_RAM_EXPERT_SLOTS", "12000"))
+        info = self.expert_info[layer]
+        g_mm, g_base, g_bytes, g_type = info["gate"]
+        # Fast-path: if this layer's experts were sequentially pinned into a Host RAM ndarray, zero-copy slice!
+        if not isinstance(g_mm, np.memmap):
+            self.cache_hits += 1
+            u_mm, u_base, u_bytes, u_type = info["up"]
+            d_mm, d_base, d_bytes, d_type = info["down"]
+            g_arr = g_mm[g_base + exp_id * g_bytes : g_base + (exp_id + 1) * g_bytes]
+            u_arr = u_mm[u_base + exp_id * u_bytes : u_base + (exp_id + 1) * u_bytes]
+            d_arr = d_mm[d_base + exp_id * d_bytes : d_base + (exp_id + 1) * d_bytes]
+            return (g_arr, g_bytes, g_type, u_arr, u_bytes, u_type, d_arr, d_bytes, d_type)
+
         key = (layer, exp_id)
         if key in self.ram_expert_cache:
             self.cache_hits += 1
             self.ram_expert_cache.move_to_end(key)
             return self.ram_expert_cache[key]
         self.cache_misses += 1
-        info = self.expert_info[layer]
-        g_mm, g_base, g_bytes, g_type = info["gate"]
         u_mm, u_base, u_bytes, u_type = info["up"]
         d_mm, d_base, d_bytes, d_type = info["down"]
         g_arr = np.array(g_mm[g_base + exp_id * g_bytes : g_base + (exp_id + 1) * g_bytes], dtype=np.uint8, copy=True)
@@ -1365,17 +1467,25 @@ class StrataTPUEngine:
 
     def _eval_routed_experts(self, layer: int, mixed_tpu: jax.Array,
                              top_ids: np.ndarray, top_weights: np.ndarray,
-                             sh_out_tpu: jax.Array, active_k: int = 4) -> jax.Array:
+                             sh_out_tpu: jax.Array, active_k: int = 2) -> jax.Array:
         """
-        Zero-Allocation Direct C++ OpenMP Expert Execution + 24 GB Host RAM Compressed Cache:
-          - Evaluates IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_NL / Q2_0 directly in C++.
-          - Zero float32 matrix allocations and zero TPU HBM thrashing.
+        Batched Single-Barrier OpenMP Expert Execution + Adaptive-K Tail Pruning:
+          - Prunes low-weight tail experts below STRATA_ROUTER_TAIL_RATIO * w[0] (r/LocalLLaMA Adaptive-K).
+          - Evaluates all active experts in a single AVX2/FMA L2-LUT C++ call.
         """
         if active_k <= 0:
             return sh_out_tpu
-        k_use = min(active_k, len(top_ids))
-        ids_k = [int(x) for x in top_ids[:k_use]]
-        w_k = np.asarray(top_weights[:k_use], dtype=np.float32)
+        k_max = min(active_k, len(top_ids))
+        w_raw = np.asarray(top_weights[:k_max], dtype=np.float32)
+        # r/LocalLLaMA Adaptive-K routing tail threshold: skip tail experts < ratio * top_expert
+        tail_ratio = float(os.environ.get("STRATA_ROUTER_TAIL_RATIO", "0.25"))
+        w0 = float(w_raw[0]) if k_max > 0 else 0.0
+        keep_mask = w_raw >= (w0 * tail_ratio)
+        if not np.any(keep_mask):
+            keep_mask[0] = True
+        ids_k = [int(top_ids[i]) for i in range(k_max) if keep_mask[i]]
+        w_k = w_raw[keep_mask]
+        k_use = len(ids_k)
         w_sum = float(np.sum(w_k))
         if w_sum > 0.0:
             w_k = w_k / w_sum
@@ -1383,36 +1493,50 @@ class StrataTPUEngine:
         mixed_np = np.ascontiguousarray(np.asarray(mixed_tpu, dtype=np.float32))
         cpu_out = np.zeros(2560, dtype=np.float32)
 
-        for eid, w_val in zip(ids_k, w_k):
-            g_arr, g_bytes, g_type, u_arr, u_bytes, u_type, d_arr, d_bytes, d_type = self._get_raw_expert_cached(layer, eid)
-            LIB_STRATA.strata_eval_expert_raw(
-                mixed_np.ctypes.data_as(ctypes.c_void_p),
-                g_arr.ctypes.data_as(ctypes.c_void_p), ctypes.c_int64(g_bytes), ctypes.c_int(g_type),
-                u_arr.ctypes.data_as(ctypes.c_void_p), ctypes.c_int64(u_bytes), ctypes.c_int(u_type),
-                d_arr.ctypes.data_as(ctypes.c_void_p), ctypes.c_int64(d_bytes), ctypes.c_int(d_type),
-                ctypes.c_float(float(w_val)),
-                cpu_out.ctypes.data_as(ctypes.c_void_p),
-            )
+        g_ptrs = (ctypes.c_void_p * k_use)()
+        u_ptrs = (ctypes.c_void_p * k_use)()
+        d_ptrs = (ctypes.c_void_p * k_use)()
+        g_bytes_arr = (ctypes.c_int64 * k_use)()
+        u_bytes_arr = (ctypes.c_int64 * k_use)()
+        d_bytes_arr = (ctypes.c_int64 * k_use)()
+        g_types_arr = (ctypes.c_int * k_use)()
+        u_types_arr = (ctypes.c_int * k_use)()
+        d_types_arr = (ctypes.c_int * k_use)()
+        w_arr = (ctypes.c_float * k_use)()
+        refs = []
 
+        for i, (eid, w_val) in enumerate(zip(ids_k, w_k)):
+            entry = self._get_raw_expert_cached(layer, eid)
+            g_arr, g_b, g_t, u_arr, u_b, u_t, d_arr, d_b, d_t = entry
+            refs.append(entry)
+            g_ptrs[i] = g_arr.ctypes.data_as(ctypes.c_void_p)
+            u_ptrs[i] = u_arr.ctypes.data_as(ctypes.c_void_p)
+            d_ptrs[i] = d_arr.ctypes.data_as(ctypes.c_void_p)
+            g_bytes_arr[i], u_bytes_arr[i], d_bytes_arr[i] = g_b, u_b, d_b
+            g_types_arr[i], u_types_arr[i], d_types_arr[i] = g_t, u_t, d_t
+            w_arr[i] = float(w_val)
+
+        LIB_STRATA.strata_eval_experts_batch(
+            mixed_np.ctypes.data_as(ctypes.c_void_p),
+            ctypes.c_int(k_use),
+            ctypes.cast(g_ptrs, ctypes.c_void_p), ctypes.cast(g_bytes_arr, ctypes.c_void_p), ctypes.cast(g_types_arr, ctypes.c_void_p),
+            ctypes.cast(u_ptrs, ctypes.c_void_p), ctypes.cast(u_bytes_arr, ctypes.c_void_p), ctypes.cast(u_types_arr, ctypes.c_void_p),
+            ctypes.cast(d_ptrs, ctypes.c_void_p), ctypes.cast(d_bytes_arr, ctypes.c_void_p), ctypes.cast(d_types_arr, ctypes.c_void_p),
+            ctypes.cast(w_arr, ctypes.c_void_p),
+            cpu_out.ctypes.data_as(ctypes.c_void_p),
+        )
         return sh_out_tpu + f32_to_tpu_f32(cpu_out, (2560,))
 
-    def forward_token(self, token_id: int, active_k: int = 4) -> jax.Array:
-        """Runs one full 48-layer token step through Qwen3.8-Flash-Next 125B MoE."""
+    def forward_token(self, token_id: int, active_k: int = 2) -> jax.Array:
+        """Runs one full 48-layer token step using Fused Single-Dispatch XLA Layer Kernels."""
         emb = self._embed_token_cpu(token_id)
         ple_emb = self._ple_gather_cpu(token_id)
-
-        # Initialize 4-stream hyper-connection residual stack R: (4, 2560)
         R = jnp.broadcast_to(emb[None, :], (4, 2560))
-
         pos_idx = self.pos
-        cos_row = self.cos_tab[pos_idx]
-        sin_row = self.sin_tab[pos_idx]
-        pos_arr = jnp.int32(pos_idx)
+        cos_row, sin_row, pos_arr = self.cos_tab[pos_idx], self.sin_tab[pos_idx], jnp.int32(pos_idx)
 
         for l in range(48):
             lw = self.layers[l]
-
-            # Layer 1 Per-Layer Token Embedding (PLE) residual update before gr_read
             if l == 1:
                 R, self.ple_hist = ple_layer1_jit(
                     ple_emb, R, self.ple_hist,
@@ -1424,63 +1548,42 @@ class StrataTPUEngine:
                     self.ple_weights["conv1d"]
                 )
 
-            # Half 1: Attention / Mixer Hyper-Connection Read
-            mixed, inject = gr_read_jit(
-                R, lw["hc_attn_norm"], lw["hc_attn_down"],
-                lw["hc_attn_up"], lw["hc_attn_inject"]
-            )
-
             if lw["is_qsa"]:
-                block_out, self.qsa_k_caches[l], self.qsa_v_caches[l] = qsa_layer_jit(
-                    mixed, pos_arr, cos_row, sin_row,
-                    self.qsa_k_caches[l], self.qsa_v_caches[l],
-                    lw["q"][0], lw["q"][1],
-                    lw["k"][0], lw["k"][1],
-                    lw["v"][0], lw["v"][1],
-                    lw["o"][0], lw["o"][1],
-                    lw["q_norm"], lw["k_norm"]
+                R_pre, R_sh, mixed_f, inj_f, sh_out_tpu, top_ids_tpu, top_weights_tpu, self.qsa_k_caches[l], self.qsa_v_caches[l] = _fused_qsa_layer_jit(
+                    R, pos_arr, cos_row, sin_row, self.qsa_k_caches[l], self.qsa_v_caches[l],
+                    lw["hc_attn_norm"], lw["hc_attn_down"], lw["hc_attn_up"], lw["hc_attn_inject"],
+                    lw["q"][0], lw["q"][1], lw["k"][0], lw["k"][1], lw["v"][0], lw["v"][1],
+                    lw["o"][0], lw["o"][1], lw["q_norm"], lw["k_norm"],
+                    lw["hc_ffn_norm"], lw["hc_ffn_down"], lw["hc_ffn_up"], lw["hc_ffn_inject"],
+                    lw["router"], lw["ginp"],
+                    lw["sgate"][0], lw["sgate"][1], lw["sup"][0], lw["sup"][1], lw["sdown"][0], lw["sdown"][1]
                 )
             else:
-                block_out, self.gdn_conv_states[l], self.gdn_ssm_states[l] = gdn_layer_jit(
-                    mixed, self.gdn_conv_states[l], self.gdn_ssm_states[l],
-                    lw["qkv"][0], lw["qkv"][1],
-                    lw["conv_w"], lw["alpha_w"], lw["beta_w"],
-                    lw["ssm_a"], lw["ssm_dt"],
-                    lw["gate"][0], lw["gate"][1],
-                    lw["ssm_norm"],
-                    lw["out"][0], lw["out"][1]
+                R_pre, R_sh, mixed_f, inj_f, sh_out_tpu, top_ids_tpu, top_weights_tpu, self.gdn_conv_states[l], self.gdn_ssm_states[l] = _fused_gdn_layer_jit(
+                    R, self.gdn_conv_states[l], self.gdn_ssm_states[l],
+                    lw["hc_attn_norm"], lw["hc_attn_down"], lw["hc_attn_up"], lw["hc_attn_inject"],
+                    lw["qkv"][0], lw["qkv"][1], lw["conv_w"], lw["alpha_w"], lw["beta_w"],
+                    lw["ssm_a"], lw["ssm_dt"], lw["gate"][0], lw["gate"][1],
+                    lw["ssm_norm"], lw["out"][0], lw["out"][1],
+                    lw["hc_ffn_norm"], lw["hc_ffn_down"], lw["hc_ffn_up"], lw["hc_ffn_inject"],
+                    lw["router"], lw["ginp"],
+                    lw["sgate"][0], lw["sgate"][1], lw["sup"][0], lw["sup"][1], lw["sdown"][0], lw["sdown"][1]
                 )
 
-            R = gr_write_jit(R, block_out, inject)
-
-            # Half 2: MoE FFN Hyper-Connection Read + Routing + Shared Expert
-            mixed, inject_ffn = gr_read_jit(
-                R, lw["hc_ffn_norm"], lw["hc_ffn_down"],
-                lw["hc_ffn_up"], lw["hc_ffn_inject"]
-            )
-            top_ids_tpu, top_weights_tpu, sh_out_tpu = moe_route_and_shared_jit(
-                mixed, lw["router"], lw["ginp"],
-                lw["sgate"][0], lw["sgate"][1],
-                lw["sup"][0], lw["sup"][1],
-                lw["sdown"][0], lw["sdown"][1]
-            )
             if active_k > 0:
-                top_ids_np = np.asarray(top_ids_tpu)
-                top_weights_np = np.asarray(top_weights_tpu)
-                moe_out = self._eval_routed_experts(l, mixed, top_ids_np, top_weights_np, sh_out_tpu, active_k=active_k)
+                moe_out = self._eval_routed_experts(
+                    l, mixed_f, np.asarray(top_ids_tpu), np.asarray(top_weights_tpu), sh_out_tpu, active_k=active_k
+                )
+                R = gr_write_jit(R_pre, moe_out, inj_f)
             else:
-                moe_out = sh_out_tpu
-            R = gr_write_jit(R, moe_out, inject_ffn)
+                R = R_sh
 
-        # Advance sequence position & PLE N-gram window
         self.prev_tokens = [self.prev_tokens[1], token_id]
         self.pos += 1
-
-        logits = lm_head_jit(
+        return lm_head_jit(
             R, self.out_hc_norm, self.out_hc_down, self.out_hc_up,
             self.out_weight[0], self.out_weight[1]
         )
-        return logits
 
     def sample_next_token(self, logits: jax.Array, temperature: float = 0.6, top_p: float = 0.95) -> int:
         if temperature <= 1e-5:

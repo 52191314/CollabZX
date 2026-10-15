@@ -12,6 +12,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 
 # 1. Clear old HBM expert cache and initialize Host RAM compressed cache
+os.environ["OMP_WAIT_POLICY"] = "ACTIVE"
+os.environ["GOMP_SPINCOUNT"] = "INFINITE"
 ENGINE.expert_cache.clear()
 ENGINE.hbm_expert_slots = 0
 if not hasattr(ENGINE, "ram_expert_cache"):
@@ -531,9 +533,16 @@ def _get_raw_expert_cached(self, layer: int, exp_id: int):
 def _eval_routed_experts_fast(self, layer, mixed_tpu, top_ids, top_weights, sh_out_tpu, active_k=2):
     if active_k <= 0:
         return sh_out_tpu
-    k_use = min(active_k, len(top_ids))
-    ids_k = [int(x) for x in top_ids[:k_use]]
-    w_k = np.asarray(top_weights[:k_use], dtype=np.float32)
+    k_max = min(active_k, len(top_ids))
+    w_raw = np.asarray(top_weights[:k_max], dtype=np.float32)
+    tail_ratio = float(os.environ.get("STRATA_ROUTER_TAIL_RATIO", "0.25"))
+    w0 = float(w_raw[0]) if k_max > 0 else 0.0
+    keep_mask = w_raw >= (w0 * tail_ratio)
+    if not np.any(keep_mask):
+        keep_mask[0] = True
+    ids_k = [int(top_ids[i]) for i in range(k_max) if keep_mask[i]]
+    w_k = w_raw[keep_mask]
+    k_use = len(ids_k)
     w_sum = float(np.sum(w_k))
     if w_sum > 0.0:
         w_k = w_k / w_sum
