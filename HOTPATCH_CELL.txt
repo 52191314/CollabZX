@@ -2,7 +2,7 @@
 # 🚀 STRATA-TPU CELL 2: HOT-PATCH RUNNER (Direct C++ OpenMP + 24 GB RAM Cache)
 #    Run this in a NEW or REPLACED cell 2 (Cell 1 stays in TPU HBM memory!)
 # ==============================================================================
-import os, sys, time, gc, json, ctypes, socket, asyncio, threading, subprocess
+import os, sys, time, gc, json, ctypes, socket, shutil, pathlib, asyncio, threading, subprocess
 from collections import OrderedDict
 import numpy as np
 import jax
@@ -20,6 +20,57 @@ ENGINE.ram_expert_slots = 12000
 ENGINE.cache_hits = 0
 ENGINE.cache_misses = 0
 gc.collect()
+
+# 1b. Stage GGUF shards from Google Drive FUSE (/content/drive) onto Local NVMe SSD (/content/local_strata)
+#     Eliminates 350-850ms Google Drive network seek latency without reloading TPU HBM backbone!
+def _hot_stage_shards_to_local_nvme(eng):
+    local_dir = pathlib.Path("/content/local_strata")
+    local_dir.mkdir(parents=True, exist_ok=True)
+    old_to_new_mm = {}
+    for attr_g, attr_mm in [("g1", "mm1"), ("g2", "mm2")]:
+        g_obj = getattr(eng, attr_g, None)
+        old_mm = getattr(eng, attr_mm, None)
+        if g_obj is None or old_mm is None:
+            continue
+        src_path = pathlib.Path(g_obj.path)
+        if not str(src_path).startswith("/content/drive"):
+            continue
+        dst_path = local_dir / src_path.name
+        src_size = src_path.stat().st_size
+        if not (dst_path.exists() and dst_path.stat().st_size == src_size):
+            free_b = shutil.disk_usage(str(local_dir)).free
+            if free_b > src_size + (4 << 30):
+                print(f"[Strata-TPU] Staging {src_path.name} ({src_size/1e9:.2f} GB) from Drive -> Local NVMe {dst_path}...")
+                t0 = time.time()
+                subprocess.run(["cp", "-f", str(src_path), str(dst_path)], check=True)
+                dt = max(time.time() - t0, 1e-3)
+                print(f"[Strata-TPU] Staged {dst_path.name} in {dt:.1f}s ({src_size/1e6/dt:.1f} MB/s)!")
+            else:
+                print(f"[Strata-TPU] Local SSD free space ({free_b/1e9:.1f} GB) < {src_size/1e9:.1f} GB for {src_path.name}; keeping on Drive + RAM cache.")
+                continue
+        else:
+            print(f"[Strata-TPU] Using existing local NVMe shard: {dst_path}")
+        new_mm = np.memmap(dst_path, dtype=np.uint8, mode="r")
+        setattr(eng, attr_mm, new_mm)
+        g_obj.path = dst_path
+        old_to_new_mm[id(old_mm)] = new_mm
+
+    if old_to_new_mm:
+        if id(eng.emb_mm) in old_to_new_mm:
+            eng.emb_mm = old_to_new_mm[id(eng.emb_mm)]
+        if id(eng.ple_mm) in old_to_new_mm:
+            eng.ple_mm = old_to_new_mm[id(eng.ple_mm)]
+            eng.ple_base_ptr = eng.ple_mm.ctypes.data + eng.ple_g._data_start + eng.ple_t.offset
+        for l in range(len(eng.expert_info)):
+            info = eng.expert_info[l]
+            for k in ("gate", "up", "down"):
+                mm, base, nbytes, tid = info[k]
+                if id(mm) in old_to_new_mm:
+                    info[k] = (old_to_new_mm[id(mm)], base, nbytes, tid)
+        print("[Strata-TPU] Rebound expert mmaps to Local NVMe SSD!")
+
+if os.environ.get("STRATA_DISABLE_LOCAL_STAGE", "0") != "1":
+    _hot_stage_shards_to_local_nvme(ENGINE)
 
 # 2. Compile Direct C++ OpenMP IQ2/IQ3/IQ4/Q2_0 Expert Evaluator
 FAST_CPP = r"""

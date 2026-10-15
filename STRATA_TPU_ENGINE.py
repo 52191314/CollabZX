@@ -807,11 +807,42 @@ class StrataTokenizer:
 # ------------------------------------------------------------------------------
 # 4. ZERO-COPY MULTI-SHARD MMAP & HYBRID TPU HBM / HOST RAM WEIGHT MANAGER
 # ------------------------------------------------------------------------------
-MODEL_DIR = pathlib.Path(
+import shutil
+
+DRIVE_MODEL_DIR = pathlib.Path(
     os.environ.get("STRATA_MODEL_DIR", "/content/drive/MyDrive/StrataModels/huihui-swift-IQ3_XXS")
 )
-SHARD1_PATH = MODEL_DIR / "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf"
-SHARD2_PATH = MODEL_DIR / "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf"
+LOCAL_MODEL_DIR = pathlib.Path(os.environ.get("STRATA_LOCAL_DIR", "/content/local_strata"))
+
+def stage_shard_to_local_ssd(src_path: pathlib.Path, local_dir: pathlib.Path) -> pathlib.Path:
+    """Stages a GGUF shard from Google Drive FUSE onto Colab's local NVMe SSD to eliminate 850ms network seek latency."""
+    if not str(src_path).startswith("/content/drive") or os.environ.get("STRATA_DISABLE_LOCAL_STAGE", "0") == "1":
+        return src_path
+    local_dir.mkdir(parents=True, exist_ok=True)
+    dst_path = local_dir / src_path.name
+    src_size = src_path.stat().st_size
+    if dst_path.exists() and dst_path.stat().st_size == src_size:
+        print(f"      [Local SSD] Already staged on NVMe: {dst_path} ({src_size / 1e9:.2f} GB)")
+        return dst_path
+    free_bytes = shutil.disk_usage(str(local_dir)).free
+    # Keep at least 4 GB headroom on Colab root disk
+    if free_bytes > src_size + (4 << 30):
+        print(f"      [Local SSD] Staging {src_path.name} ({src_size / 1e9:.2f} GB) from Google Drive -> {dst_path} (Free: {free_bytes / 1e9:.1f} GB)...")
+        t_cp = time.time()
+        subprocess.run(["cp", "-f", str(src_path), str(dst_path)], check=True)
+        dt_cp = max(time.time() - t_cp, 1e-3)
+        print(f"      [Local SSD] Staged {dst_path.name} in {dt_cp:.1f}s ({src_size / 1e6 / dt_cp:.1f} MB/s)!")
+        return dst_path
+    else:
+        print(f"      [Local SSD] Insufficient disk for {src_path.name} (Need {src_size / 1e9:.1f} GB, Free {free_bytes / 1e9:.1f} GB); using Drive + 24 GB Host RAM Cache.")
+        return src_path
+
+SHARD1_PATH = stage_shard_to_local_ssd(
+    DRIVE_MODEL_DIR / "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf", LOCAL_MODEL_DIR
+)
+SHARD2_PATH = stage_shard_to_local_ssd(
+    DRIVE_MODEL_DIR / "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf", LOCAL_MODEL_DIR
+)
 
 def dequantize_buffer_to_f32(raw_u8: np.ndarray, type_id: int, n_elems: int) -> np.ndarray:
     """Fast C++/OpenMP or gguf-py dequantization of any GGUF tensor slice into float32."""
