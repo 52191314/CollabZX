@@ -47,7 +47,7 @@ def setup_cloud_machine():
     print("      Installing Python packages (gguf, regex, fastapi, uvicorn, jax[tpu])...")
     subprocess.run(
         [sys.executable, "-m", "pip", "install", "-q",
-         "gguf", "regex", "jinja2", "fastapi", "uvicorn", "pydantic", "nest_asyncio"],
+         "gguf", "regex", "jinja2", "fastapi", "uvicorn", "pydantic", "nest_asyncio", "psutil"],
         check=True
     )
     # Ensure jax[tpu] + libtpu.so are installed if TPU PCI/VFIO device is present
@@ -243,16 +243,16 @@ void strata_f32_to_int8_rowwise(const float* src, int8_t* dst_q, uint16_t* dst_s
 }
 
 static uint8_t g_ksigns[128];
-alignas(16) static float g_iq3xxs_lut[16][256][4];
-alignas(16) static float g_iq3s_lut[16][512][4];
-alignas(16) static float g_iq2xxs_lo[16][256][4];
-alignas(16) static float g_iq2xxs_hi[16][256][4];
-alignas(16) static float g_iq2xs_lo[16][512][4];
-alignas(16) static float g_iq2xs_hi[16][512][4];
-alignas(16) static float g_iq2s_lo[16][1024][4];
-alignas(16) static float g_iq2s_hi[16][1024][4];
-alignas(16) static float g_q2_lut[256][4];
-alignas(16) static float g_iq4nl_f32[16];
+alignas(64) static float g_iq3xxs_lut[16][256][4];
+alignas(64) static float g_iq3s_lut[16][512][4];
+alignas(64) static float g_iq2xxs_lo[16][256][4];
+alignas(64) static float g_iq2xxs_hi[16][256][4];
+alignas(64) static float g_iq2xs_lo[16][512][4];
+alignas(64) static float g_iq2xs_hi[16][512][4];
+alignas(64) static float g_iq2s_lo[16][1024][4];
+alignas(64) static float g_iq2s_hi[16][1024][4];
+alignas(64) static float g_q2_lut[256][4];
+alignas(64) static float g_iq4nl_f32[16];
 
 void strata_init_iq_grids(const uint8_t* p2xxs, const uint8_t* p2xs, const uint8_t* p2s,
                           const uint8_t* p3xxs, const uint8_t* p3s, const uint8_t* psigns) {
@@ -349,10 +349,12 @@ static inline float strata_dot_row_raw(const uint8_t* __restrict__ row_ptr, int 
         const int64_t nb = n_cols / 256;
         for (int64_t b = 0; b < nb; ++b) {
             const uint8_t* blk = row_ptr + b * 98;
+            _mm_prefetch((const char*)(blk + 196), _MM_HINT_T0);
             const float d = fp16_to_fp32(read_u16(blk));
             const uint8_t* qs = blk + 2;
             const uint8_t* scales = blk + 66;
             const float* xb = x + b * 256;
+            _mm_prefetch((const char*)(xb + 64), _MM_HINT_T0);
             for (int ib = 0; ib < 8; ++ib) {
                 uint32_t sw; std::memcpy(&sw, scales + ib * 4, 4);
                 const __m256 vdb = _mm256_set1_ps(d * (0.5f + (float)(sw >> 28)) * 0.5f);
@@ -489,7 +491,7 @@ void strata_eval_experts_batch(
     alignas(32) float hidden[10][640];
     #pragma omp parallel
     {
-        #pragma omp for collapse(2) schedule(static)
+        #pragma omp for collapse(2) schedule(dynamic, 16)
         for (int e = 0; e < n_exp; ++e) {
             for (int64_t r = 0; r < 640; ++r) {
                 const int64_t g_rb = g_bytes[e] / 640;
@@ -499,7 +501,7 @@ void strata_eval_experts_batch(
                 hidden[e][r] = (ga / (1.0f + std::exp(-ga))) * ua;
             }
         }
-        #pragma omp for schedule(static)
+        #pragma omp for schedule(dynamic, 64)
         for (int64_t r = 0; r < 2560; ++r) {
             float acc = 0.0f;
             for (int e = 0; e < n_exp; ++e) {
@@ -841,11 +843,50 @@ class StrataTokenizer:
 # 4. ZERO-COPY MULTI-SHARD MMAP & HYBRID TPU HBM / HOST RAM WEIGHT MANAGER
 # ------------------------------------------------------------------------------
 import shutil
+import psutil
+
+# Auto-detect Kaggle TPU VM (330 GB Host RAM) vs Colab (47 GB Host RAM)
+_total_ram_gb = psutil.virtual_memory().total / (1 << 30) if "psutil" in sys.modules else 48.0
+_use_shm = _total_ram_gb > 100.0 and os.path.exists("/dev/shm")
+_default_local_dir = "/dev/shm/strata" if _use_shm else "/content/local_strata"
 
 DRIVE_MODEL_DIR = pathlib.Path(
     os.environ.get("STRATA_MODEL_DIR", "/content/drive/MyDrive/StrataModels/huihui-swift-IQ3_XXS")
 )
-LOCAL_MODEL_DIR = pathlib.Path(os.environ.get("STRATA_LOCAL_DIR", "/content/local_strata"))
+LOCAL_MODEL_DIR = pathlib.Path(os.environ.get("STRATA_LOCAL_DIR", _default_local_dir))
+if _use_shm and "STRATA_RAM_PIN_GB" not in os.environ:
+    os.environ["STRATA_RAM_PIN_GB"] = "120.0"
+    print(f"      [High-RAM System Detected] {_total_ram_gb:.1f} GB Host RAM! Pinning up to 120 GB in /dev/shm!")
+
+HF_SHARDS = {
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf": "https://huggingface.co/huihui-ai/Qwen3.8-Flash-Next-abliterated-GGUF/resolve/main/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf": "https://huggingface.co/huihui-ai/Qwen3.8-Flash-Next-abliterated-GGUF/resolve/main/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf",
+}
+
+def resolve_or_download_shard(shard_name: str) -> pathlib.Path:
+    """Finds shard on NVMe SSD, Drive, or downloads directly via aria2c if running on Kaggle/cloud VM without Drive."""
+    LOCAL_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    local_path = LOCAL_MODEL_DIR / shard_name
+    drive_path = DRIVE_MODEL_DIR / shard_name
+
+    if local_path.exists():
+        print(f"      [Storage] Shard ready at local path: {local_path} ({local_path.stat().st_size / 1e9:.2f} GB)")
+        return local_path
+    if drive_path.exists():
+        # Drive exists, attempt staging to NVMe SSD if space permits
+        return stage_shard_to_local_ssd(drive_path, LOCAL_MODEL_DIR)
+
+    # Neither exists: download directly from HuggingFace via aria2c
+    hf_url = HF_SHARDS.get(shard_name)
+    if not hf_url:
+        raise FileNotFoundError(f"Shard {shard_name} not found on Drive or local disk, and no HF URL registered!")
+    print(f"\n      [Direct Cloud Download] Downloading {shard_name} directly to {LOCAL_MODEL_DIR} via aria2c (16 connections)...")
+    subprocess.run(["apt-get", "install", "-y", "-q", "aria2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run([
+        "aria2c", "-x", "16", "-s", "16", "-k", "10M", "--summary-interval=5",
+        "-d", str(LOCAL_MODEL_DIR), "-o", shard_name, hf_url
+    ], check=True)
+    return local_path
 
 def stage_shard_to_local_ssd(src_path: pathlib.Path, local_dir: pathlib.Path) -> pathlib.Path:
     """Stages a GGUF shard from Google Drive FUSE onto Colab's local NVMe SSD to eliminate 850ms network seek latency."""
@@ -870,12 +911,8 @@ def stage_shard_to_local_ssd(src_path: pathlib.Path, local_dir: pathlib.Path) ->
         print(f"      [Local SSD] Insufficient disk for {src_path.name} (Need {src_size / 1e9:.1f} GB, Free {free_bytes / 1e9:.1f} GB); using Drive + 24 GB Host RAM Cache.")
         return src_path
 
-SHARD1_PATH = stage_shard_to_local_ssd(
-    DRIVE_MODEL_DIR / "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf", LOCAL_MODEL_DIR
-)
-SHARD2_PATH = stage_shard_to_local_ssd(
-    DRIVE_MODEL_DIR / "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf", LOCAL_MODEL_DIR
-)
+SHARD1_PATH = resolve_or_download_shard("Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf")
+SHARD2_PATH = resolve_or_download_shard("Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf")
 
 def dequantize_buffer_to_f32(raw_u8: np.ndarray, type_id: int, n_elems: int) -> np.ndarray:
     """Fast C++/OpenMP or gguf-py dequantization of any GGUF tensor slice into float32."""
@@ -1539,7 +1576,7 @@ class StrataTPUEngine:
         )
         return sh_out_tpu + f32_to_tpu_f32(cpu_out, (2560,))
 
-    def forward_token(self, token_id: int, active_k: int = 2) -> jax.Array:
+    def forward_token(self, token_id: int, active_k: int = 2, compute_logits: bool = True) -> Optional[jax.Array]:
         """Runs one full 48-layer token step using Fused Single-Dispatch XLA Layer Kernels."""
         emb = self._embed_token_cpu(token_id)
         ple_emb = self._ple_gather_cpu(token_id)
@@ -1592,6 +1629,8 @@ class StrataTPUEngine:
 
         self.prev_tokens = [self.prev_tokens[1], token_id]
         self.pos += 1
+        if not compute_logits:
+            return None
         return lm_head_jit(
             R, self.out_hc_norm, self.out_hc_down, self.out_hc_up,
             self.out_weight[0], self.out_weight[1]
@@ -1626,10 +1665,12 @@ class StrataTPUEngine:
         t0 = time.time()
         logits = None
         for idx, tid in enumerate(prompt_ids):
-            k_step = decode_k if (idx == len(prompt_ids) - 1) else prefill_k
-            logits = self.forward_token(tid, active_k=k_step)
+            is_last = (idx == len(prompt_ids) - 1)
+            k_step = decode_k if is_last else prefill_k
+            logits = self.forward_token(tid, active_k=k_step, compute_logits=is_last)
         prefill_s = time.time() - t0
-        print(f"[Strata-TPU] Prefill complete in {prefill_s:.2f}s. Decoding...")
+        tok_s = len(prompt_ids) / max(prefill_s, 1e-3)
+        print(f"[Strata-TPU] Prefill complete in {prefill_s:.2f}s ({tok_s:.1f} tok/s). Decoding...")
 
         for step in range(max_tokens):
             next_id = self.sample_next_token(logits, temperature=temperature, top_p=top_p)
@@ -1637,7 +1678,7 @@ class StrataTPUEngine:
                 break
             piece = self.tokenizer.decode([next_id])
             yield piece
-            logits = self.forward_token(next_id, active_k=decode_k)
+            logits = self.forward_token(next_id, active_k=decode_k, compute_logits=True)
 
 # ------------------------------------------------------------------------------
 # 7. LAUNCH ENGINE + FASTAPI GATEWAY + CLOUDFLARE PUBLIC TUNNEL
