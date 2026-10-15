@@ -50,6 +50,18 @@ def setup_cloud_machine():
          "gguf", "regex", "jinja2", "fastapi", "uvicorn", "pydantic", "nest_asyncio"],
         check=True
     )
+    # Ensure jax[tpu] + libtpu.so are installed if TPU PCI/VFIO device is present
+    has_tpu_dev = os.path.exists("/dev/vfio") or os.path.exists("/dev/accel0") or ("COLAB_TPU_ADDR" in os.environ) or ("TPU_NAME" in os.environ)
+    try:
+        import libtpu  # noqa: F401
+    except ImportError:
+        if has_tpu_dev:
+            print("      Installing jax[tpu] + libtpu driver for Colab TPU v5e-1...")
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-q", "-U",
+                 "jax[tpu]", "-f", "https://storage.googleapis.com/jax-releases/libtpu_releases.html"],
+                check=True
+            )
 
     if not os.path.exists("/usr/local/bin/cloudflared"):
         print("      Installing cloudflared tunnel binary...")
