@@ -154,17 +154,17 @@ static inline uint16_t read_u16(const uint8_t* p) {
 static const int8_t kvalues_iq4nl[16] = {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113};
 static uint8_t g_ksigns[128];
 
-// Pre-signed 16-byte aligned SIMD lookup tables (< 1.1 MB total -> fits in L2 cache!)
-alignas(16) static float g_iq3xxs_lut[16][256][4];
-alignas(16) static float g_iq3s_lut[16][512][4];
-alignas(16) static float g_iq2xxs_lo[16][256][4];
-alignas(16) static float g_iq2xxs_hi[16][256][4];
-alignas(16) static float g_iq2xs_lo[16][512][4];
-alignas(16) static float g_iq2xs_hi[16][512][4];
-alignas(16) static float g_iq2s_lo[16][1024][4];
-alignas(16) static float g_iq2s_hi[16][1024][4];
-alignas(16) static float g_q2_lut[256][4];
-alignas(16) static float g_iq4nl_f32[16];
+// Pre-signed 64-byte aligned SIMD lookup tables (< 1.1 MB total -> fits in L2 cache!)
+alignas(64) static float g_iq3xxs_lut[16][256][4];
+alignas(64) static float g_iq3s_lut[16][512][4];
+alignas(64) static float g_iq2xxs_lo[16][256][4];
+alignas(64) static float g_iq2xxs_hi[16][256][4];
+alignas(64) static float g_iq2xs_lo[16][512][4];
+alignas(64) static float g_iq2xs_hi[16][512][4];
+alignas(64) static float g_iq2s_lo[16][1024][4];
+alignas(64) static float g_iq2s_hi[16][1024][4];
+alignas(64) static float g_q2_lut[256][4];
+alignas(64) static float g_iq4nl_f32[16];
 
 void strata_init_iq_grids(const uint8_t* p2xxs, const uint8_t* p2xs, const uint8_t* p2s,
                           const uint8_t* p3xxs, const uint8_t* p3s, const uint8_t* psigns) {
@@ -262,10 +262,12 @@ static inline float strata_dot_row_raw(const uint8_t* __restrict__ row_ptr, int 
         const int64_t nb = n_cols / 256;
         for (int64_t b = 0; b < nb; ++b) {
             const uint8_t* blk = row_ptr + b * 98;
+            _mm_prefetch((const char*)(blk + 196), _MM_HINT_T0);
             const float d = fp16_to_fp32(read_u16(blk));
             const uint8_t* qs = blk + 2;
             const uint8_t* scales = blk + 66;
             const float* xb = x + b * 256;
+            _mm_prefetch((const char*)(xb + 64), _MM_HINT_T0);
             for (int ib = 0; ib < 8; ++ib) {
                 uint32_t sw; std::memcpy(&sw, scales + ib * 4, 4);
                 const __m256 vdb = _mm256_set1_ps(d * (0.5f + (float)(sw >> 28)) * 0.5f);
@@ -402,7 +404,7 @@ void strata_eval_experts_batch(
     alignas(32) float hidden[10][640];
     #pragma omp parallel
     {
-        #pragma omp for collapse(2) schedule(static)
+        #pragma omp for collapse(2) schedule(dynamic, 16)
         for (int e = 0; e < n_exp; ++e) {
             for (int64_t r = 0; r < 640; ++r) {
                 const int64_t g_rb = g_bytes[e] / 640;
@@ -412,7 +414,7 @@ void strata_eval_experts_batch(
                 hidden[e][r] = (ga / (1.0f + std::exp(-ga))) * ua;
             }
         }
-        #pragma omp for schedule(static)
+        #pragma omp for schedule(dynamic, 64)
         for (int64_t r = 0; r < 2560; ++r) {
             float acc = 0.0f;
             for (int e = 0; e < n_exp; ++e) {
@@ -584,7 +586,7 @@ def _eval_routed_experts_fast(self, layer, mixed_tpu, top_ids, top_weights, sh_o
     )
     return sh_out_tpu + f32_to_tpu_f32(cpu_out, (2560,))
 
-def _forward_token_fast(self, token_id: int, active_k: int = 2) -> jax.Array:
+def _forward_token_fast(self, token_id: int, active_k: int = 2, compute_logits: bool = True) -> Optional[jax.Array]:
     emb = self._embed_token_cpu(token_id)
     ple_emb = self._ple_gather_cpu(token_id)
     R = jnp.broadcast_to(emb[None, :], (4, 2560))
@@ -630,6 +632,8 @@ def _forward_token_fast(self, token_id: int, active_k: int = 2) -> jax.Array:
             R = R_sh
     self.prev_tokens = [self.prev_tokens[1], token_id]
     self.pos += 1
+    if not compute_logits:
+        return None
     return lm_head_jit(R, self.out_hc_norm, self.out_hc_down, self.out_hc_up, self.out_weight[0], self.out_weight[1])
 
 def _generate_fast(self, messages, max_tokens=256, temperature=0.6, top_p=0.95):
@@ -642,15 +646,18 @@ def _generate_fast(self, messages, max_tokens=256, temperature=0.6, top_p=0.95):
     t0 = time.time()
     logits = None
     for idx, tid in enumerate(prompt_ids):
-        k_step = decode_k if (idx == len(prompt_ids) - 1) else prefill_k
-        logits = self.forward_token(tid, active_k=k_step)
-    print(f"[Strata-TPU] Prefill done in {time.time() - t0:.2f}s! Decoding (RAM cache={len(self.ram_expert_cache)})...")
+        is_last = (idx == len(prompt_ids) - 1)
+        k_step = decode_k if is_last else prefill_k
+        logits = self.forward_token(tid, active_k=k_step, compute_logits=is_last)
+    dt_pre = time.time() - t0
+    tok_s = len(prompt_ids) / max(dt_pre, 1e-3)
+    print(f"[Strata-TPU] Prefill done in {dt_pre:.2f}s ({tok_s:.1f} tok/s)! Decoding (RAM cache={len(self.ram_expert_cache)})...")
     for _ in range(max_tokens):
         next_id = self.sample_next_token(logits, temperature=temperature, top_p=top_p)
         if next_id in (self.tokenizer.eos_id, self.tokenizer.im_end_id):
             break
         yield self.tokenizer.decode([next_id])
-        logits = self.forward_token(next_id, active_k=decode_k)
+        logits = self.forward_token(next_id, active_k=decode_k, compute_logits=True)
 
 import types
 ENGINE._get_raw_expert_cached = types.MethodType(_get_raw_expert_cached, ENGINE)
