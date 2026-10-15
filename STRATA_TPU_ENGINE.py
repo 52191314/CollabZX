@@ -1373,16 +1373,26 @@ def start_cloudflared_tunnel(port: int = 8080):
                     print(f"    Health & Cache    : {token}/health")
                     print("=" * 80 + "\n")
 
-print("\n[6/6] Launching FastAPI Gateway + Cloudflare Public Tunnel on port 8080...")
-threading.Thread(target=start_cloudflared_tunnel, args=(8080,), daemon=True).start()
+def _pick_free_port(start_port: int = 8000) -> int:
+    import socket
+    for p in range(start_port, start_port + 50):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(("127.0.0.1", p)) != 0:
+                return p
+    return 8000
+
+STRATA_PORT = _pick_free_port(8000)
+print(f"\n[6/6] Launching FastAPI Gateway + Cloudflare Public Tunnel on port {STRATA_PORT}...")
+threading.Thread(target=start_cloudflared_tunnel, args=(STRATA_PORT,), daemon=True).start()
 
 def _serve_uvicorn():
     import asyncio
-    cfg = uvicorn.Config(app, host="0.0.0.0", port=8080, log_level="info")
+    cfg = uvicorn.Config(app, host="0.0.0.0", port=STRATA_PORT, log_level="info")
     srv = uvicorn.Server(cfg)
     asyncio.run(srv.serve())
 
 _uv_thread = threading.Thread(target=_serve_uvicorn, daemon=True)
 _uv_thread.start()
 _uv_thread.join()
+
 
