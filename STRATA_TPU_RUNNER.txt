@@ -859,34 +859,76 @@ if _use_shm and "STRATA_RAM_PIN_GB" not in os.environ:
     print(f"      [High-RAM System Detected] {_total_ram_gb:.1f} GB Host RAM! Pinning up to 120 GB in /dev/shm!")
 
 HF_SHARDS = {
-    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf": "https://huggingface.co/huihui-ai/Qwen3.8-Flash-Next-abliterated-GGUF/resolve/main/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
-    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf": "https://huggingface.co/huihui-ai/Qwen3.8-Flash-Next-abliterated-GGUF/resolve/main/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf",
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf": "https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF/resolve/main/swift-IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf": "https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF/resolve/main/swift-IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf",
 }
 
+def _find_shard_on_drive(shard_name: str) -> Optional[pathlib.Path]:
+    """Searches Google Drive (including MyDrive, shortcuts, and Shared drives) for the GGUF shard."""
+    candidates = [
+        DRIVE_MODEL_DIR / shard_name,
+        pathlib.Path("/content/drive/MyDrive/huihui-swift-IQ3_XXS") / shard_name,
+        pathlib.Path("/content/drive/MyDrive/StrataModels") / shard_name,
+        pathlib.Path("/content/drive/MyDrive") / shard_name,
+    ]
+    for c in candidates:
+        if c.exists() and c.stat().st_size > (1 << 30):
+            return c
+    drive_root = pathlib.Path("/content/drive")
+    if drive_root.exists():
+        for root_sub in ("MyDrive", ".shortcut-targets-by-id", "Shareddrives"):
+            sub = drive_root / root_sub
+            if sub.exists():
+                try:
+                    for found in sub.rglob(shard_name):
+                        if found.is_file() and found.stat().st_size > (1 << 30):
+                            return found
+                except Exception:
+                    pass
+    return None
+
 def resolve_or_download_shard(shard_name: str) -> pathlib.Path:
-    """Finds shard on NVMe SSD, Drive, or downloads directly via aria2c if running on Kaggle/cloud VM without Drive."""
+    """Finds shard on Google Drive (or local SSD), or downloads it if missing."""
     LOCAL_MODEL_DIR.mkdir(parents=True, exist_ok=True)
     local_path = LOCAL_MODEL_DIR / shard_name
-    drive_path = DRIVE_MODEL_DIR / shard_name
 
-    if local_path.exists():
+    if local_path.exists() and local_path.stat().st_size > (1 << 30):
         print(f"      [Storage] Shard ready at local path: {local_path} ({local_path.stat().st_size / 1e9:.2f} GB)")
         return local_path
-    if drive_path.exists():
-        # Drive exists, attempt staging to NVMe SSD if space permits
+
+    drive_path = _find_shard_on_drive(shard_name)
+    if drive_path is not None:
+        print(f"      [Google Drive] Found shard on Drive: {drive_path} ({drive_path.stat().st_size / 1e9:.2f} GB)")
         return stage_shard_to_local_ssd(drive_path, LOCAL_MODEL_DIR)
 
-    # Neither exists: download directly from HuggingFace via aria2c
+    # Not found on Drive: check if Drive is mounted and warn user about shortcut or download directly to Drive
     hf_url = HF_SHARDS.get(shard_name)
     if not hf_url:
         raise FileNotFoundError(f"Shard {shard_name} not found on Drive or local disk, and no HF URL registered!")
-    print(f"\n      [Direct Cloud Download] Downloading {shard_name} directly to {LOCAL_MODEL_DIR} via aria2c (16 connections)...")
+
+    if os.path.exists("/content/drive/MyDrive"):
+        try:
+            top_items = [p.name for p in pathlib.Path("/content/drive/MyDrive").iterdir()][:15]
+            print(f"      [Drive Warning] {shard_name} not found in /content/drive! MyDrive contents: {top_items}")
+            print("      [Drive Hint] If using a secondary Google account, make sure you shared 'StrataModels' and clicked 'Add shortcut to Drive' -> 'My Drive'!")
+        except Exception:
+            pass
+        # Download into Google Drive so we don't blow up Colab's small local disk and so it persists!
+        DRIVE_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        dl_dir = DRIVE_MODEL_DIR
+    else:
+        dl_dir = LOCAL_MODEL_DIR
+
+    dl_target = dl_dir / shard_name
+    print(f"\n      [Direct Cloud Download] Downloading {shard_name} to {dl_dir} via aria2c (16 connections)...")
     subprocess.run(["apt-get", "install", "-y", "-q", "aria2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run([
-        "aria2c", "-x", "16", "-s", "16", "-k", "10M", "--summary-interval=5",
-        "-d", str(LOCAL_MODEL_DIR), "-o", shard_name, hf_url
+        "aria2c", "-c", "-x", "16", "-s", "16", "-k", "10M", "--summary-interval=5",
+        "-d", str(dl_dir), "-o", shard_name, hf_url
     ], check=True)
-    return local_path
+    if str(dl_target).startswith("/content/drive"):
+        return stage_shard_to_local_ssd(dl_target, LOCAL_MODEL_DIR)
+    return dl_target
 
 def stage_shard_to_local_ssd(src_path: pathlib.Path, local_dir: pathlib.Path) -> pathlib.Path:
     """Stages a GGUF shard from Google Drive FUSE onto Colab's local NVMe SSD to eliminate 850ms network seek latency."""
