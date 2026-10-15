@@ -1375,4 +1375,14 @@ def start_cloudflared_tunnel(port: int = 8080):
 
 print("\n[6/6] Launching FastAPI Gateway + Cloudflare Public Tunnel on port 8080...")
 threading.Thread(target=start_cloudflared_tunnel, args=(8080,), daemon=True).start()
-uvicorn.run(app, host="0.0.0.0", port=8080, log_level="info")
+
+def _serve_uvicorn():
+    import asyncio
+    cfg = uvicorn.Config(app, host="0.0.0.0", port=8080, log_level="info")
+    srv = uvicorn.Server(cfg)
+    asyncio.run(srv.serve())
+
+_uv_thread = threading.Thread(target=_serve_uvicorn, daemon=True)
+_uv_thread.start()
+_uv_thread.join()
+
