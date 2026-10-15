@@ -73,11 +73,11 @@ def setup_cloud_machine():
 
 setup_cloud_machine()
 
-# Mount Google Drive if running inside Colab
-if not os.path.exists("/content/drive/MyDrive"):
+# Optional Google Drive mount (Disabled by default: aria2c directly from HF to NVMe SSD is 10x faster than Drive FUSE)
+if os.environ.get("USE_GOOGLE_DRIVE", "0") == "1" and not os.path.exists("/content/drive/MyDrive"):
     try:
         from google.colab import drive
-        print("      Mounting 5 TB Google Drive at /content/drive...")
+        print("      Mounting Google Drive at /content/drive...")
         drive.mount("/content/drive")
     except ImportError:
         pass
@@ -906,57 +906,34 @@ def _find_shard_on_drive(shard_name: str) -> Optional[pathlib.Path]:
     return None
 
 def resolve_or_download_shard(shard_name: str) -> pathlib.Path:
-    """Finds shard on Google Drive (or local SSD), auto-remounting Drive if a shortcut was just added."""
+    """Finds shard on local NVMe SSD, or downloads directly from HuggingFace via aria2c (16 parallel streams, ~3 mins)."""
     LOCAL_MODEL_DIR.mkdir(parents=True, exist_ok=True)
     local_path = LOCAL_MODEL_DIR / shard_name
 
+    # 1. Fast path: already on NVMe SSD (instant 0s start)
     if local_path.exists() and local_path.stat().st_size > (1 << 30):
-        print(f"      [Storage] Shard ready at local path: {local_path} ({local_path.stat().st_size / 1e9:.2f} GB)")
+        print(f"      [NVMe SSD Cache] Shard ready: {local_path} ({local_path.stat().st_size / 1e9:.2f} GB)")
         return local_path
 
-    drive_path = _find_shard_on_drive(shard_name)
-    if drive_path is None and os.path.exists("/content/drive"):
-        # If the user just added the shortcut in Google Drive UI while Colab was already mounted, force remount to refresh FUSE cache!
-        try:
-            from google.colab import drive
-            print(f"      [Google Drive] Refreshing Drive mount to pick up new shortcuts for {shard_name}...")
-            drive.mount("/content/drive", force_remount=True)
-            drive_path = _find_shard_on_drive(shard_name)
-        except Exception:
-            pass
+    # 2. Check if user explicitly asked to use Google Drive
+    if os.environ.get("USE_GOOGLE_DRIVE", "0") == "1" and os.path.exists("/content/drive"):
+        drive_path = _find_shard_on_drive(shard_name)
+        if drive_path is not None:
+            print(f"      [Google Drive] Found shard on Drive: {drive_path} ({drive_path.stat().st_size / 1e9:.2f} GB)")
+            return stage_shard_to_local_ssd(drive_path, LOCAL_MODEL_DIR)
 
-    if drive_path is not None:
-        print(f"      [Google Drive] Found shard on Drive: {drive_path} ({drive_path.stat().st_size / 1e9:.2f} GB)")
-        return stage_shard_to_local_ssd(drive_path, LOCAL_MODEL_DIR)
-
-    # Not found on Drive: check if Drive is mounted and warn user about shortcut or download directly to Drive
+    # 3. Primary Fast Path: Direct download from HuggingFace straight to NVMe SSD via aria2c (16 connections, ~250 MB/s, ~3-4 mins)
     hf_url = HF_SHARDS.get(shard_name)
     if not hf_url:
-        raise FileNotFoundError(f"Shard {shard_name} not found on Drive or local disk, and no HF URL registered!")
+        raise FileNotFoundError(f"Shard {shard_name} has no registered HuggingFace URL!")
 
-    if os.path.exists("/content/drive/MyDrive"):
-        try:
-            top_items = [p.name for p in pathlib.Path("/content/drive/MyDrive").iterdir()][:15]
-            print(f"      [Drive Warning] {shard_name} not found in /content/drive! MyDrive contents: {top_items}")
-            print("      [Drive Hint] If using a secondary Google account, make sure you shared 'StrataModels' and clicked 'Add shortcut to Drive' -> 'My Drive'!")
-        except Exception:
-            pass
-        # Download into Google Drive so we don't blow up Colab's small local disk and so it persists!
-        DRIVE_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        dl_dir = DRIVE_MODEL_DIR
-    else:
-        dl_dir = LOCAL_MODEL_DIR
-
-    dl_target = dl_dir / shard_name
-    print(f"\n      [Direct Cloud Download] Downloading {shard_name} to {dl_dir} via aria2c (16 connections)...")
+    print(f"\n      [Direct Cloud Download] Downloading {shard_name} directly to NVMe SSD ({LOCAL_MODEL_DIR}) via aria2c (16 streams, ~3 mins)...")
     subprocess.run(["apt-get", "install", "-y", "-q", "aria2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run([
         "aria2c", "-c", "-x", "16", "-s", "16", "-k", "10M", "--summary-interval=5",
-        "-d", str(dl_dir), "-o", shard_name, hf_url
+        "-d", str(LOCAL_MODEL_DIR), "-o", shard_name, hf_url
     ], check=True)
-    if str(dl_target).startswith("/content/drive"):
-        return stage_shard_to_local_ssd(dl_target, LOCAL_MODEL_DIR)
-    return dl_target
+    return local_path
 
 def stage_shard_to_local_ssd(src_path: pathlib.Path, local_dir: pathlib.Path) -> pathlib.Path:
     """Stages a GGUF shard from Google Drive FUSE onto Colab's local NVMe SSD to eliminate 850ms network seek latency."""
